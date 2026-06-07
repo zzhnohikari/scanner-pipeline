@@ -40,7 +40,7 @@ cat targets.txt | sort -u > /tmp/targets_filtered.txt
 pip3 install beautifulsoup4 --break-system-packages
 
 # 4. 运行
-python3 deep_scanner_v7.py
+python3 deep_scanner.py
 
 # 5. 查看结果
 cat /tmp/v7_scan_results/v7_report.json
@@ -96,7 +96,7 @@ cat /tmp/v7_scan_results/v7_report.json
 
 | 文件 | 用途 |
 |------|------|
-| `pipeline/deep_scanner_v7.py` | **主扫描器 v7 (当前)** |
+| `pipeline/deep_scanner.py` | **主扫描器 v7 (当前)** |
 | `pipeline/deep_scanner.py` | 主扫描器 v6 |
 | `pipeline/unauth_scanner.py` | 未授权测试器 (基于 jjjjjsz) |
 | `pipeline/scanner.py` | 早期全量版本 |

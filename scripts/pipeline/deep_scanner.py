@@ -225,14 +225,18 @@ def check_response(body, url, method, test_name):
         has_data = (isinstance(d, list) and len(d)>0) or (isinstance(d, dict) and d and set(d.keys())-{"path","time","timestamp","error","status"}) or bool(parsed.get("records")) or bool(parsed.get("list")) or bool(parsed.get("items"))
         if has_data or code in ("0","200","20000"):
             f = {"url":url,"method":method,"test":test_name,"code":code,"msg":msg[:200]}
-            if isinstance(d, list): f["data_count"]=len(d)
+            if isinstance(d, list):
+                f["data_count"]=len(d)
+                if d and isinstance(d[0], dict): f["data_keys"] = list(d[0].keys())[:15]
             elif isinstance(d, dict): f["data_keys"]=list(d.keys())[:15]
             if "secret" in body.lower() or "password" in body.lower(): f["credential_leak"]=True
             f["risk"] = risk_level(f)
             f["raw"] = body[:500]
             return f
     elif parsed and isinstance(parsed, list) and len(parsed)>0:
-        return {"url":url,"method":method,"test":test_name,"data_count":len(parsed),"risk":"MEDIUM","raw":body[:500]}
+        f = {"url":url,"method":method,"test":test_name,"data_count":len(parsed),"risk":"MEDIUM","raw":body[:500]}
+        if isinstance(parsed[0], dict): f["data_keys"] = list(parsed[0].keys())[:15]; f["risk"] = risk_level(f)
+        return f
     return None
 
 # ===== API 测试（双模式） =====

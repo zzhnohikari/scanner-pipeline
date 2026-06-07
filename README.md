@@ -106,8 +106,10 @@ cat results/report.md     # Markdown 报告 (含风险分级)
 ### 风险分级规则
 - CRITICAL: 凭证泄露 + 大量数据 / 敏感字段(secret/password/phone/email)
 - HIGH: 凭证泄露 / 大量数据(>10条)
-- MEDIUM: 有数据返回
+- MEDIUM: 有数据返回 / Swagger/Druid等API文档暴露(攻击路径情报)
 - LOW: 端点可达但无可利用数据
+
+> Swagger/API-Docs/Druid 虽不直接算比赛分，但是攻击路径情报——暴露全部 API 端点、参数、认证方式，可据此精准打击其他接口。
 
 ## 关键技术
 
@@ -131,8 +133,9 @@ cat results/report.md     # Markdown 报告 (含风险分级)
 
 ## 比赛算分标准
 
-- ✅ 算分: 摄像头/IoT 接管, 公民信息, RCE, 可利用的攻击路径
-- ❌ 不算: 版本号, RSA 密钥(单独), 框架类型, Swagger 文档
+- ✅ 直接算分: 摄像头/IoT 接管, 公民信息, RCE, 可利用的攻击路径
+- ⚠️ 攻击路径情报: Swagger/API-Docs/Druid（不直接算分，但暴露所有 API 可据此深挖）
+- ❌ 不算: 版本号, RSA 密钥(单独), 框架类型
 
 ## 参考项目
 

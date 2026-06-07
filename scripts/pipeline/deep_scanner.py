@@ -265,6 +265,11 @@ def extract_prefixes_from_content(content):
 
 # ===== 响应检测 =====
 def risk_level(fi):
+    url = fi.get('url','').lower()
+    # API文档是攻击路径情报 — 不算直接分但价值高
+    if any(kw in url for kw in ['swagger','api-docs','druid','/v2/api','/v3/api','openapi']):
+        fi['attack_path_intel'] = True
+        return 'MEDIUM'
     score = 0
     if fi.get('credential_leak'): score += 3
     if fi.get('data_count', 0) > 10: score += 2

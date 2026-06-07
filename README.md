@@ -96,8 +96,7 @@ cat /tmp/v7_scan_results/v7_report.json
 
 | 文件 | 用途 |
 |------|------|
-| `pipeline/deep_scanner.py` | **主扫描器 v7 (当前)** |
-| `pipeline/deep_scanner.py` | 主扫描器 v6 |
+| `pipeline/deep_scanner.py` | **主扫描器 (当前)** |
 | `pipeline/unauth_scanner.py` | 未授权测试器 (基于 jjjjjsz) |
-| `pipeline/scanner.py` | 早期全量版本 |
+| `pipeline/scanner.py` | 初版全量扫描器 |
 | `batch_scan/` | TCP 探测 + JS 提取工具 |

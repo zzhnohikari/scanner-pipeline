@@ -82,7 +82,12 @@ BASELINE_PATHS = [
     "/api/server/media_server/list","/api/device/query/devices?page=1&count=10",
     "/api/user/users?page=1&count=10","/api/server/system/configInfo",
     "/api/server/resource/info","/api/role/all","/api/log/list",
+    "/swagger-ui.html","/swagger/index.html","/swagger-ui/index.html",
+    "/v2/api-docs","/v3/api-docs","/druid/index.html","/druid/datasource.json",
+    "/druid/sql.json","/druid/websession.json","/druid/wall.json","/druid/basic.json",
+    "/druid/stat.json","/actuator","/actuator/env",
 ]
+SWAGGER_DOC_PATHS = ["/v2/api-docs", "/v3/api-docs", "/openapi.json", "/swagger.json"]
 AUTH_FAIL_MSGS = ["缺少请求授权令牌","token无效","未登录","请登录","Unauthorized","Forbidden"]
 
 # ===== 工具函数 =====
@@ -263,13 +268,75 @@ def extract_prefixes_from_content(content):
             prefixes.update(normalize_api_prefixes(path))
     return prefixes
 
+def extract_swagger_apis(doc_text):
+    apis = set()
+    try:
+        doc = json.loads(doc_text)
+    except Exception:
+        return apis
+    if not isinstance(doc, dict):
+        return apis
+    paths = doc.get("paths")
+    if isinstance(paths, dict):
+        for path in paths.keys():
+            if isinstance(path, str) and path.startswith("/") and len(path) < 250:
+                apis.add(re.sub(r"\{[^}/]+\}", "1", path))
+    for key in ("basePath", "servers"):
+        value = doc.get(key)
+        if isinstance(value, str):
+            prefix = normalize_api_prefixes(value)
+            for p in prefix:
+                for api in list(apis):
+                    if not api.startswith(p + "/"):
+                        apis.add(p + api)
+        elif isinstance(value, list):
+            for item in value:
+                url = item.get("url") if isinstance(item, dict) else item
+                if isinstance(url, str):
+                    for p in normalize_api_prefixes(url):
+                        for api in list(apis):
+                            if not api.startswith(p + "/"):
+                                apis.add(p + api)
+    return apis
+
+def api_priority(path):
+    p = path.lower()
+    score = 0
+    weighted = [
+        (80, ["camera","video","stream","media","gb28181","rtsp","play","live","channel","device"]),
+        (70, ["user","person","people","citizen","resident","idcard","identity","realname","phone","mobile"]),
+        (60, ["config","system","admin","role","permission","auth","token","password","secret"]),
+        (50, ["file","upload","download","export","import","backup"]),
+        (40, ["alarm","alert","record","log","history","trace"]),
+        (35, ["swagger","api-docs","druid","actuator","openapi"]),
+        (25, ["list","query","search","page","all"]),
+    ]
+    for weight, words in weighted:
+        if any(w in p for w in words):
+            score += weight
+    if p.startswith(("/api/", "/prod-api/", "/dev-api/", "/gateway/")):
+        score += 15
+    if re.search(r"/(?:get|list|query|search|page|all)(?:/|$)", p):
+        score += 10
+    if "delete" in p or "remove" in p:
+        score -= 30
+    return (-score, len(path), path)
+
+def collect_swagger_apis(base):
+    apis = set()
+    for doc_path in SWAGGER_DOC_PATHS:
+        s, _, doc, _ = http_get(urljoin(base, doc_path), max_size=1_000_000)
+        if s == 200 and doc:
+            apis.update(extract_swagger_apis(doc))
+    return apis
+
 # ===== 响应检测 =====
 def risk_level(fi):
     url = fi.get('url','').lower()
     # API文档是攻击路径情报 — 不算直接分但价值高
-    if any(kw in url for kw in ['swagger','api-docs','druid','/v2/api','/v3/api','openapi']):
+    attack_path = any(kw in url for kw in ['swagger','api-docs','druid','/v2/api','/v3/api','openapi','/actuator'])
+    if attack_path:
         fi['attack_path_intel'] = True
-        return 'MEDIUM'
     score = 0
     if fi.get('credential_leak'): score += 3
     if fi.get('data_count', 0) > 10: score += 2
@@ -277,24 +344,32 @@ def risk_level(fi):
         keys_str = ' '.join(fi['data_keys']).lower()
         if any(k in keys_str for k in ['secret','password','token','key']): score += 3
         if any(k in keys_str for k in ['phone','email','address','idcard','身份证']): score += 3
+        if any(k in keys_str for k in ['camera','cameraid','deviceid','stream','streamurl','rtsp','playurl','channel','gb28181']):
+            score += 3
+        if any(k in keys_str for k in ['plate','plateno','latitude','longitude','lng','lat','gps']):
+            score += 2
     if score >= 5: return 'CRITICAL'
     if score >= 3: return 'HIGH'
-    if score >= 1: return 'MEDIUM'
+    if score >= 1 or attack_path: return 'MEDIUM'
     return 'LOW'
 
-def check_response(body, url, method, test_name):
+def check_response(body, url, method, test_name, status_code=None):
     if len(body) < 20: return None
+    url_lower = url.lower()
+    attack_path = any(kw in url_lower for kw in ['swagger','api-docs','druid','/v2/api','/v3/api','openapi','/actuator'])
+    attack_path_ok = attack_path and (status_code is None or 200 <= int(status_code) < 300)
     parsed = None
     try: parsed = json.loads(body)
     except: pass
     if parsed and isinstance(parsed, dict):
-        code = str(parsed.get("code","") or parsed.get("statusCode","") or parsed.get("status",""))
+        code_val = next((parsed[k] for k in ("code","statusCode","status") if k in parsed and parsed[k] is not None), "")
+        code = str(code_val)
         msg = str(parsed.get("msg","") or parsed.get("message",""))
         if code in ("10031","401","403","500002","40001"): return None
         if any(p in msg for p in AUTH_FAIL_MSGS): return None
         d = parsed.get("data")
         has_data = (isinstance(d, list) and len(d)>0) or (isinstance(d, dict) and d and set(d.keys())-{"path","time","timestamp","error","status"}) or bool(parsed.get("records")) or bool(parsed.get("list")) or bool(parsed.get("items"))
-        if has_data or code in ("0","200","20000"):
+        if has_data or code in ("0","200","20000") or attack_path_ok:
             f = {"url":url,"method":method,"test":test_name,"code":code,"msg":msg[:200]}
             if isinstance(d, list):
                 f["data_count"]=len(d)
@@ -307,6 +382,9 @@ def check_response(body, url, method, test_name):
     elif parsed and isinstance(parsed, list) and len(parsed)>0:
         f = {"url":url,"method":method,"test":test_name,"data_count":len(parsed),"risk":"MEDIUM","raw":body[:500]}
         if isinstance(parsed[0], dict): f["data_keys"] = list(parsed[0].keys())[:15]; f["risk"] = risk_level(f)
+        return f
+    elif attack_path_ok:
+        f = {"url":url,"method":method,"test":test_name,"attack_path_intel":True,"risk":"MEDIUM","raw":body[:500]}
         return f
     return None
 
@@ -329,7 +407,7 @@ def test_api(base_url, path, bypass_tests, short_circuit=True):
                 req = Request(url, data=data, headers=h, method=method)
                 resp = urlopen(req, timeout=API_TIMEOUT, context=ssl_ctx)
                 body = resp.read().decode('utf-8', errors='replace')
-                f = check_response(body, url, method, name)
+                f = check_response(body, url, method, name, resp.getcode())
                 if f:
                     findings.append(f)
                     if short_circuit: return findings
@@ -337,7 +415,7 @@ def test_api(base_url, path, bypass_tests, short_circuit=True):
                 if e.code not in (404,403,405):
                     try:
                         b = e.read().decode('utf-8', errors='replace')
-                        f = check_response(b, url, method, name)
+                        f = check_response(b, url, method, name, e.code)
                         if f:
                             findings.append(f)
                             if short_circuit: return findings
@@ -396,9 +474,11 @@ def main():
         page_url = url if url.endswith("/") else url + "/"
         path_prefixes = path_prefixes_from_url(page_url)
         status, final_url, html, ct = http_get(page_url)
+        swagger_apis = collect_swagger_apis(base)
         if not status or not html or len(html) < 50:
-            apis = expand_with_prefixes(set(BASELINE_PATHS), path_prefixes)
-            return {"base":base,"title":"","apis":sorted(apis),"sensitive":[],"js_count":0}
+            apis = set(BASELINE_PATHS) | swagger_apis
+            apis = expand_with_prefixes(apis, path_prefixes)
+            return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"sensitive":[],"js_count":0}
         title = ""
         m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
         if m: title = m.group(1)[:200]
@@ -439,10 +519,11 @@ def main():
                 if s.strip():
                     all_apis.update(extract_apis(s))
                     path_prefixes.update(extract_prefixes_from_content(s))
+        all_apis.update(swagger_apis)
         all_apis = expand_paths(base, all_apis)
         all_apis.update(BASELINE_PATHS)
         all_apis = expand_with_prefixes(all_apis, path_prefixes)
-        clean = sorted(a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:")))
+        clean = sorted((a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))), key=api_priority)
         sensitive = [a for a in all_apis if a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))]
         if not clean: return None
         return {"base":base,"title":title,"apis":clean,"sensitive":sensitive,"js_count":len(app_js)}
@@ -492,7 +573,7 @@ def main():
 
     candidates = []
     for base, t in target_map.items():
-        real = [f for f in t["_f"] if f.get("data_count") or f.get("data_keys") or f.get("credential_leak")]
+        real = [f for f in t["_f"] if f.get("data_count") or f.get("data_keys") or f.get("credential_leak") or f.get("attack_path_intel")]
         t.pop("_f", None)
         if real: t["_f3a_real"] = real; candidates.append(t)
     print(f"  3a: {len(candidates)} candidates")

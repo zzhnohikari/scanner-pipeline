@@ -57,6 +57,7 @@ COMMON_LIBS = re.compile(r'(?:jquery|bootstrap|vue\.min|vue\.runtime|react\.min|
 VUE_INSTANCE_RE = re.compile(r'''__vue_app__|__vue__|createApp|createRouter|new Vue\(|useRouter|useRoute''')
 VUE_ROUTER_RE = re.compile(r'''(?:path|route)\s*:\s*["']([^"']{1,200})["']''', re.I)
 REACT_ROUTE_RE = re.compile(r'<Route\s+(?:path|to)\s*=\s*["\x27]([^"\x27]{1,200})["\x27]', re.I)
+API_PREFIX_RE = re.compile(r'''(?:baseURL|baseUrl|apiBase|apiPrefix|contextPath|publicPath|proxyPrefix)\s*[:=]\s*["'](/[^"']{1,120})["']''', re.I)
 
 WEB_PORTS = [80,443,8080,8443,8001,81,82,88,3000,4000,5000,7000,8000,8002,8003,8008,8081,8088,8089,8888,9000,9090,9443,10000,10080]
 
@@ -197,6 +198,56 @@ def expand_paths(base_url, apis):
             if api.startswith(p): expanded.add(api[len(p):])
     return expanded
 
+def origin_from_url(raw_url):
+    p = urlparse(raw_url)
+    origin = f"{p.scheme}://{p.hostname}"
+    if p.port and p.port not in (80,443): origin += f":{p.port}"
+    return origin
+
+def path_prefixes_from_url(raw_url):
+    """Infer deployment prefixes such as /abcabc from target/final URLs."""
+    path = urlparse(raw_url).path or ""
+    if not path or path == "/": return set()
+    path = path.rstrip("/")
+    if not path: return set()
+    parts = [p for p in path.strip("/").split("/") if p]
+    if parts and "." in parts[-1]:
+        parts = parts[:-1]
+    return {'/' + '/'.join(parts[:i]) for i in range(1, len(parts)+1)}
+
+def expand_with_prefixes(apis, prefixes):
+    expanded = set(apis)
+    clean_prefixes = {p.rstrip("/") for p in prefixes if p and p != "/"}
+    for api in list(apis):
+        if not api.startswith("/"): continue
+        for prefix in clean_prefixes:
+            if api == prefix or api.startswith(prefix + "/"):
+                if api.startswith(prefix + "/"):
+                    stripped = api[len(prefix):]
+                    if stripped: expanded.add(stripped)
+                continue
+            expanded.add(prefix + api)
+    return expanded
+
+def normalize_api_prefix(path):
+    path = path.split("?")[0].split("#")[0].rstrip("/")
+    if not path.startswith("/") or path == "/": return None
+    parts = [p for p in path.strip("/").split("/") if p]
+    lowered = [p.lower() for p in parts]
+    if "api" in lowered:
+        idx = lowered.index("api")
+        if idx == 0: return None
+        parts = parts[:idx]
+    if not parts: return None
+    return "/" + "/".join(parts)
+
+def extract_prefixes_from_content(content):
+    prefixes = set()
+    for m in API_PREFIX_RE.finditer(content):
+        prefix = normalize_api_prefix(m.group(1).strip())
+        if prefix: prefixes.add(prefix)
+    return prefixes
+
 # ===== 响应检测 =====
 def risk_level(fi):
     score = 0
@@ -321,25 +372,28 @@ def main():
 
     api_results, done = [], 0
     def crawl(url):
-        p = urlparse(url)
-        base = f"{p.scheme}://{p.hostname}"
-        if p.port and p.port not in (80,443): base += f":{p.port}"
-        status, final_url, html, ct = http_get(url + "/")
+        base = origin_from_url(url)
+        page_url = url if url.endswith("/") else url + "/"
+        path_prefixes = path_prefixes_from_url(page_url)
+        status, final_url, html, ct = http_get(page_url)
         if not status or not html or len(html) < 50:
-            return {"base":base,"title":"","apis":list(BASELINE_PATHS),"sensitive":[],"js_count":0}
+            apis = expand_with_prefixes(set(BASELINE_PATHS), path_prefixes)
+            return {"base":base,"title":"","apis":sorted(apis),"sensitive":[],"js_count":0}
         title = ""
         m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
         if m: title = m.group(1)[:200]
         if final_url:
-            p2 = urlparse(final_url)
-            base = f"{p2.scheme}://{p2.hostname}"
-            if p2.port and p2.port not in (80,443): base += f":{p2.port}"
-        js_urls = extract_js_from_html(html, base)
-        links = extract_links_from_html(html, base)
+            page_url = final_url
+            base = origin_from_url(final_url)
+            path_prefixes.update(path_prefixes_from_url(final_url))
+        js_urls = extract_js_from_html(html, page_url)
+        links = extract_links_from_html(html, page_url)
         inline_scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html, re.I)
         all_apis = set()
         for s in inline_scripts:
-            if s.strip(): all_apis.update(extract_apis(s))
+            if s.strip():
+                all_apis.update(extract_apis(s))
+                path_prefixes.update(extract_prefixes_from_content(s))
         if VUE_INSTANCE_RE.search(html):
             for m in VUE_ROUTER_RE.finditer(html): all_apis.add(m.group(1))
         for m in REACT_ROUTE_RE.finditer(html): all_apis.add(m.group(1))
@@ -348,6 +402,7 @@ def main():
             s, _, content, _ = http_get(js_url, max_size=500_000)
             if s != 200 or not content: continue
             all_apis.update(extract_apis(content))
+            path_prefixes.update(extract_prefixes_from_content(content))
             for m in SENSITIVE_FIELD_RE.finditer(content): all_apis.add(f"SENSITIVE:{m.group(1)[:100]}")
             for m in INTERNAL_IP_RE.finditer(content): all_apis.add(f"INTERNAL_IP:{m.group(0)}")
             for m in JDBC_RE.finditer(content): all_apis.add(f"JDBC:{m.group(0)}")
@@ -357,13 +412,16 @@ def main():
             crawled.add(link)
             s, _, page, _ = http_get(link)
             if s != 200 or not page or len(page) < 100: continue
-            sub_js = extract_js_from_html(page, base)
+            sub_js = extract_js_from_html(page, link)
             for js in sub_js:
                 if not COMMON_LIBS.search(js): js_urls.add(js)
             for s in re.findall(r'<script[^>]*>([\s\S]*?)</script>', page, re.I):
-                if s.strip(): all_apis.update(extract_apis(s))
+                if s.strip():
+                    all_apis.update(extract_apis(s))
+                    path_prefixes.update(extract_prefixes_from_content(s))
         all_apis = expand_paths(base, all_apis)
         all_apis.update(BASELINE_PATHS)
+        all_apis = expand_with_prefixes(all_apis, path_prefixes)
         clean = sorted(a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:")))
         sensitive = [a for a in all_apis if a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))]
         if not clean: return None

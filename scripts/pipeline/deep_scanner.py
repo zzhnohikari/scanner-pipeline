@@ -57,7 +57,13 @@ COMMON_LIBS = re.compile(r'(?:jquery|bootstrap|vue\.min|vue\.runtime|react\.min|
 VUE_INSTANCE_RE = re.compile(r'''__vue_app__|__vue__|createApp|createRouter|new Vue\(|useRouter|useRoute''')
 VUE_ROUTER_RE = re.compile(r'''(?:path|route)\s*:\s*["']([^"']{1,200})["']''', re.I)
 REACT_ROUTE_RE = re.compile(r'<Route\s+(?:path|to)\s*=\s*["\x27]([^"\x27]{1,200})["\x27]', re.I)
-API_PREFIX_RE = re.compile(r'''(?:baseURL|baseUrl|apiBase|apiPrefix|contextPath|publicPath|proxyPrefix)\s*[:=]\s*["'](/[^"']{1,120})["']''', re.I)
+API_PREFIX_RE = re.compile(
+    r'''(?:baseURL|baseUrl|baseApi|apiBase|apiPrefix|apiUrl|apiURL|api_url|apiHost|api_host|'''
+    r'''contextPath|serverBase|serverUrl|serverURL|proxyPrefix|VUE_APP_BASE_API|'''
+    r'''VUE_APP_API_BASE|VUE_APP_API_URL|REACT_APP_API_URL|REACT_APP_BASE_API|'''
+    r'''NEXT_PUBLIC_API_URL|API_BASE_URL|API_BASE|API_URL|BASE_API)\s*[:=]\s*["']((?:https?:)?//[^"']{1,220}|/[^"']{1,160})["']''',
+    re.I)
+PUBLIC_PATH_RE = re.compile(r'''(?:publicPath|assetsPublicPath)\s*[:=]\s*["']((?:https?:)?//[^"']{1,220}|/[^"']{1,160})["']''', re.I)
 
 WEB_PORTS = [80,443,8080,8443,8001,81,82,88,3000,4000,5000,7000,8000,8002,8003,8008,8081,8088,8089,8888,9000,9090,9443,10000,10080]
 
@@ -229,23 +235,32 @@ def expand_with_prefixes(apis, prefixes):
             expanded.add(prefix + api)
     return expanded
 
-def normalize_api_prefix(path):
+def normalize_api_prefixes(path):
+    if path.startswith("//"):
+        path = urlparse("http:" + path).path
+    elif path.startswith(("http://", "https://")):
+        path = urlparse(path).path
     path = path.split("?")[0].split("#")[0].rstrip("/")
-    if not path.startswith("/") or path == "/": return None
+    if not path.startswith("/") or path == "/": return set()
     parts = [p for p in path.strip("/").split("/") if p]
+    if not parts: return set()
     lowered = [p.lower() for p in parts]
+    prefixes = {"/" + "/".join(parts)}
     if "api" in lowered:
         idx = lowered.index("api")
-        if idx == 0: return None
-        parts = parts[:idx]
-    if not parts: return None
-    return "/" + "/".join(parts)
+        if idx > 0:
+            prefixes.add("/" + "/".join(parts[:idx]))
+    return prefixes
 
 def extract_prefixes_from_content(content):
     prefixes = set()
     for m in API_PREFIX_RE.finditer(content):
-        prefix = normalize_api_prefix(m.group(1).strip())
-        if prefix: prefixes.add(prefix)
+        prefixes.update(normalize_api_prefixes(m.group(1).strip()))
+    for m in PUBLIC_PATH_RE.finditer(content):
+        path = m.group(1).strip()
+        lowered = path.lower()
+        if any(marker in lowered for marker in ("/api", "api-", "-api", "gateway", "openapi")):
+            prefixes.update(normalize_api_prefixes(path))
     return prefixes
 
 # ===== 响应检测 =====

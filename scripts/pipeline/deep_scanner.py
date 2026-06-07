@@ -557,11 +557,11 @@ def main():
         for bp in BASELINE_PATHS: flat_tasks.append((t, bp))
     print(f"  3a: {len(flat_tasks)} tasks on {len(target_map)} hosts")
     t_start = time.time()
-    bypass_3a = bypass_used if args.full_bypass else FAST_BYPASS
+    # 3a always uses FAST — speed over thoroughness for screening
     with ThreadPoolExecutor(max_workers=WORKERS*2) as pool:
         def test_flat(task):
             t, api = task
-            return t["base"], test_api(t["base"], api, bypass_3a, short_circuit=not args.full_bypass)
+            return t["base"], test_api(t["base"], api, FAST_BYPASS, short_circuit=True)
         futures = {pool.submit(test_flat, ft): ft for ft in flat_tasks}
         for f in as_completed(futures):
             try:

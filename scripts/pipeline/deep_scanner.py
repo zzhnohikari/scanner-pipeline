@@ -20,6 +20,7 @@ parser.add_argument('--limit', type=int, default=0, help='限制目标数量,0=�
 parser.add_argument('--dry-run', action='store_true', help='只提取API,不测试')
 parser.add_argument('--full-bypass', action='store_true', help='收集所有绕过方法(默认命中断路)')
 parser.add_argument('--debug', action='store_true', help='调试日志')
+parser.add_argument('--no-proxy', action='store_true', help='绕过系统代理(ClashX等)')
 args = parser.parse_args()
 
 log = logging.getLogger('scanner')
@@ -39,6 +40,13 @@ except ImportError:
 ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
+
+# 绕过系统代理 (ClashX 等 macOS 系统级代理)
+if args.no_proxy:
+    import urllib.request as _ur
+    _proxy_handler = _ur.ProxyHandler({})
+    _no_proxy_opener = _ur.build_opener(_proxy_handler)
+    _ur.install_opener(_no_proxy_opener)
 
 # ===== 正则（从参考项目继承） =====
 LINKFINDER_RE = re.compile(r"""

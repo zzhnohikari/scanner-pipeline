@@ -94,6 +94,33 @@ QUERY_PARAM_RE = re.compile(r'''[?&]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})=''')
 OBJECT_PARAM_RE = re.compile(r'''["']?([a-zA-Z_][a-zA-Z0-9_]{1,40})["']?\s*:\s*["']?([a-zA-Z0-9_\-./:@]{1,120})["']?''')
 FORM_FIELD_RE = re.compile(r'''(?:name|v-model|prop|field)\s*=\s*["']([a-zA-Z_][a-zA-Z0-9_.\-\[\]]{1,60})["']''', re.I)
 REQUEST_BODY_RE = re.compile(r'''(?:params|data|body)\s*:\s*\{([^{}]{1,2000})\}''', re.I)
+
+def _extract_url_body_pairs(text):
+    """Extract (url, body_text) pairs from common JS patterns, handling nested braces."""
+    pairs = []
+    # Pattern 1: request({url:"/api/x", ..., data:{...}})
+    for m in re.finditer(r'''request\s*\(\s*\{\s*url\s*:\s*["']([^"']{2,200})["'].*?data\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 2: fetch("/api/x", {body:JSON.stringify({...})})
+    for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*JSON\.stringify\s*\((\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 3: http.post("/api/x", {...}) / axios.post("/api/x", {...})
+    for m in re.finditer(r'''(?:http|axios)\.(?:post|put|patch)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 4: $.ajax({url:"/api/x", data:{...}}) / $.post({url:"/api/x", data:{...}})
+    for m in re.finditer(r'''\$\.(?:ajax|post|get)\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["'].*?data\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 5: $.get("/api/x", {...}) / $.post("/api/x", {...})
+    for m in re.finditer(r'''\$\.(?:get|post)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 6: axios.get("/api/x", {params: {...}})
+    for m in re.finditer(r'''axios\.get\s*\(\s*["']([^"']{2,200})["']\s*,\s*\{[^}]*?params\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 7: window.open("/api/x?param="+value) / location.href="/api/x?id="+id
+    for m in re.finditer(r'''(?:window\.open|location\.href)\s*\(\s*["']([^"']{2,200}\?(?:[a-zA-Z_][a-zA-Z0-9_]*=)["']\s*\+)''', text, re.I):
+        url_part = m.group(1).rstrip('"+ ')
+        pairs.append((url_part.split("?")[0], ""))
+    return pairs
 FILE_SEED_RE = re.compile(r'''["']([a-zA-Z0-9_\-./]{1,120}\.(?:pdf|doc|docx|xls|xlsx|csv|zip|rar|7z|jpg|jpeg|png|gif|txt))["']''', re.I)
 NUMERIC_ID_RE = re.compile(r'''(?:id|Id|ID|fileId|docId|recordId|userId|deptId|orgId|attachId)\s*[:=]\s*["']?(\d{1,12})["']?''')
 COMMON_PARAM_HINTS = {
@@ -379,6 +406,8 @@ def add_seed(profile, value, file_hint=False):
         return
     if value.lower() in ("null", "true", "false", "undefined"):
         return
+    if not file_hint and (value.startswith("/") or "://" in value):
+        return
     if file_hint or re.search(r"\.(?:pdf|doc|docx|xls|xlsx|csv|zip|rar|7z|jpg|jpeg|png|gif|txt)$", value, re.I):
         profile["file_seeds"].add(value)
     elif re.match(r"^[a-zA-Z0-9_\-./:@]{1,120}$", value):
@@ -390,6 +419,8 @@ def merge_param_profiles(dst, src):
     dst["file_seeds"].update(src.get("file_seeds", set()))
     for path, names in src.get("api_params", {}).items():
         dst["api_params"].setdefault(path, set()).update(names)
+    for api in src.get("_apis_from_params", set()):
+        dst.setdefault("_apis_from_params", set()).add(api)
     return dst
 
 def extract_param_profile(content):
@@ -397,6 +428,10 @@ def extract_param_profile(content):
     if not content or args.disable_param_harvest:
         return profile
     sample = content[:1_500_000]
+    # 从URL-body配对中提取的路径也加入API集合
+    for url_path, body_text in _extract_url_body_pairs(sample):
+        if url_path and url_path.startswith("/"):
+            profile.setdefault("_apis_from_params", set()).add(url_path)
     for m in QUERY_PARAM_RE.finditer(sample):
         add_param_name(profile, m.group(1))
     for m in FORM_FIELD_RE.finditer(sample):
@@ -405,10 +440,22 @@ def extract_param_profile(content):
         add_seed(profile, m.group(1), file_hint=True)
     for m in NUMERIC_ID_RE.finditer(sample):
         add_seed(profile, m.group(1))
+    # URL+body 配对提取: 将参数绑定到具体URL
+    for url_path, body_text in _extract_url_body_pairs(sample):
+        if url_path and body_text:
+            for key, value in OBJECT_PARAM_RE.findall(body_text):
+                add_param_name(profile, key, api_path=url_path)
+                add_seed(profile, value)
+    # 全局 body 提取 (无URL上下文)
     for m in REQUEST_BODY_RE.finditer(sample):
         for key, value in OBJECT_PARAM_RE.findall(m.group(1)):
             add_param_name(profile, key)
             add_seed(profile, value)
+    # 从表达式提取字面种子值: pageNum: p.pageNum||1 → "1", pageSize: 20 → "20"
+    for m in re.finditer(r'''(?:[|?&]|\|\||&&|,\s*)\s*(\d{1,6})\s*(?:[,\s\)\}\]])''', sample):
+        add_seed(profile, m.group(1))
+    for m in re.finditer(r'''["']([a-zA-Z0-9_\-]{1,40})["']\s*[:=]\s*(\d{1,6})''', sample):
+        add_seed(profile, m.group(2))
     for m in OBJECT_PARAM_RE.finditer(sample):
         key, value = m.group(1), m.group(2)
         if key in COMMON_PARAM_HINTS or key.endswith(("Id", "ID", "Name", "Path", "Key")):
@@ -419,13 +466,26 @@ def extract_param_profile(content):
             add_param_name(profile, q.group(1), api)
     return profile
 
-def prioritized_param_names(profile, path):
-    names = []
+def path_param_candidates(path):
     clean = path.split("?")[0].rstrip("/")
-    for candidate in (clean, "/" + clean.strip("/")):
-        for name in profile.get("api_params", {}).get(candidate, set()):
+    candidates = [clean, "/" + clean.strip("/")]
+    parts = clean.strip("/").split("/")
+    for i in range(1, len(parts)):
+        candidates.append("/" + "/".join(parts[i:]))
+    return list(dict.fromkeys(c for c in candidates if c and c != "/"))
+
+def bound_param_names(profile, path):
+    names = []
+    for candidate in path_param_candidates(path):
+        bound = profile.get("api_params", {}).get(candidate, set())
+        for name in sorted(bound):
             if name not in names:
                 names.append(name)
+    return names
+
+def prioritized_param_names(profile, path):
+    names = bound_param_names(profile, path)
+    clean = path.split("?")[0].rstrip("/")
     p = clean.lower()
     harvested = sorted(profile.get("names", set()))
     hinted = [n for n in harvested if n in COMMON_PARAM_HINTS or n.endswith(("Id", "ID", "Name", "Path", "Key", "Code"))]
@@ -453,10 +513,33 @@ def should_param_probe(path, profile):
     p = clean.lower()
     if is_file_endpoint(clean) or any(k in p for k in PARAM_PROBE_KEYWORDS):
         return True
-    for candidate in (clean, "/" + clean.strip("/")):
+    for candidate in path_param_candidates(clean):
         if profile.get("api_params", {}).get(candidate):
             return True
     return False
+
+def param_seed_value(name, seeds):
+    lname = name.lower()
+    if lname in ("pagenum", "pageno", "page", "current"):
+        return "1"
+    if lname in ("pagesize", "size", "limit", "count"):
+        return "10"
+    if lname in ("keyword", "keywords", "query", "search", "name", "username"):
+        return "test"
+    if lname in ("format",):
+        return "xlsx"
+    if lname in ("status",):
+        return "1"
+    if lname in ("type", "devicetype"):
+        return "camera"
+    if lname in ("protocol", "stream"):
+        return "rtsp"
+    if lname.endswith(("id", "ids")) or lname in ("id", "deptid", "orgid", "userid", "deviceid", "channelid", "fileid"):
+        return "1"
+    for seed in seeds:
+        if seed and not seed.startswith("/") and "://" not in seed:
+            return seed
+    return "1"
 
 def param_query_suffixes(path, profile):
     if not should_param_probe(path, profile):
@@ -465,13 +548,22 @@ def param_query_suffixes(path, profile):
     if not names:
         return []
     seeds = ["1", "2", "10", "100", "test"]
-    dynamic = sorted(profile.get("seeds", set()))[:20]
+    dynamic = [s for s in sorted(profile.get("seeds", set())) if not s.startswith("/") and "://" not in s][:20]
     file_dynamic = sorted(profile.get("file_seeds", set()))[:20]
     if is_file_endpoint(path):
         seeds = list(dict.fromkeys(file_dynamic + FILE_SEED_VALUES + dynamic + seeds))
     else:
         seeds = list(dict.fromkeys(dynamic + seeds))
     probes = []
+    # 组合fuzz只使用URL绑定参数, 避免全局参数池污染真实前端流量形态。
+    bound_names = bound_param_names(profile, path)
+    if bound_names and len(bound_names) >= 2:
+        combo_parts = []
+        for bn in bound_names[:5]:
+            sv = param_seed_value(bn, seeds)
+            combo_parts.append(f"{bn}={sv}")
+        if combo_parts:
+            probes.append("?" + "&".join(combo_parts))
     for name in names:
         for value in seeds:
             probes.append(f"?{name}={value}")
@@ -479,11 +571,12 @@ def param_query_suffixes(path, profile):
                 return probes
     return probes
 
-def query_suffixes(path, profile=None):
+def query_suffixes(path, profile=None, allow_param_probe=True):
     suffixes = file_query_suffixes(path)
-    for qs in param_query_suffixes(path, profile or {}):
-        if qs not in suffixes:
-            suffixes.append(qs)
+    if allow_param_probe:
+        for qs in param_query_suffixes(path, profile or {}):
+            if qs not in suffixes:
+                suffixes.append(qs)
     return suffixes
 
 def extract_apis(js_content):
@@ -752,12 +845,12 @@ def check_response(body, url, method, test_name, status_code=None):
     return None
 
 # ===== API 测试（双模式） =====
-def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=None):
+def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=None, allow_param_probe=True):
     clean = path.split("?")[0].rstrip("/")
     if not clean: return []
     url_base = urljoin(base_url, clean)
     findings = []
-    for qs in query_suffixes(clean, param_profile):
+    for qs in query_suffixes(clean, param_profile, allow_param_probe=allow_param_probe):
         url = url_base + qs
         for name, method, ct, bf, headers in bypass_tests:
             try:
@@ -1049,6 +1142,10 @@ def main():
                     all_apis.update(extract_apis(s))
                     path_prefixes.update(extract_prefixes_from_content(s))
                     merge_param_profiles(param_profile, extract_param_profile(s))
+        # 将参数画像提取到的URL补充进API集合
+        for extra_api in param_profile.get("_apis_from_params", set()):
+            if extra_api.startswith("/"):
+                all_apis.add(extra_api)
         all_apis.update(swagger_apis)
         all_apis = expand_paths(base, all_apis)
         all_apis.update(BASELINE_PATHS)
@@ -1121,7 +1218,7 @@ def main():
     try:
         def test_flat(task):
             t, api = task
-            return t["base"], test_api(t["base"], api, FAST_BYPASS, short_circuit=True, param_profile=t.get("param_profile"))
+            return t["base"], test_api(t["base"], api, FAST_BYPASS, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=False)
         futures = {pool.submit(test_flat, ft): ft for ft in flat_tasks}
         pending = set(futures)
         completed = 0
@@ -1171,7 +1268,7 @@ def main():
             t_start = time.time()
             def test_rescue(task):
                 t, api = task
-                return t["base"], test_api(t["base"], api, FULL_BYPASS, short_circuit=True, param_profile=t.get("param_profile"))
+                return t["base"], test_api(t["base"], api, FULL_BYPASS, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=False)
             def handle_rescue(result):
                 base_url, findings = result
                 real = useful_findings(findings)

@@ -98,25 +98,41 @@ REQUEST_BODY_RE = re.compile(r'''(?:params|data|body)\s*:\s*\{([^{}]{1,2000})\}'
 def _extract_url_body_pairs(text):
     """Extract (url, body_text) pairs from common JS patterns, handling nested braces."""
     pairs = []
+    obj = r'''\{(?:[^{}]|\{[^{}]*\})*\}'''
     # Pattern 1: request({url:"/api/x", ..., data:{...}})
-    for m in re.finditer(r'''request\s*\(\s*\{\s*url\s*:\s*["']([^"']{2,200})["'].*?data\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+    for m in re.finditer(r'''request\s*\(\s*\{\s*url\s*:\s*["']([^"']{2,200})["'].*?(?:data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
         pairs.append((m.group(1), m.group(2)))
     # Pattern 2: fetch("/api/x", {body:JSON.stringify({...})})
-    for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*JSON\.stringify\s*\((\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+    for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*JSON\.stringify\s*\((''' + obj + r''')''', text, re.I):
         pairs.append((m.group(1), m.group(2)))
-    # Pattern 3: http.post("/api/x", {...}) / axios.post("/api/x", {...})
-    for m in re.finditer(r'''(?:http|axios)\.(?:post|put|patch)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+    # Pattern 3: fetch("/api/x?"+new URLSearchParams({...}))
+    for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["']\s*\+\s*new\s+URLSearchParams\s*\((''' + obj + r''')''', text, re.I):
         pairs.append((m.group(1), m.group(2)))
-    # Pattern 4: $.ajax({url:"/api/x", data:{...}}) / $.post({url:"/api/x", data:{...}})
-    for m in re.finditer(r'''\$\.(?:ajax|post|get)\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["'].*?data\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+    # Pattern 4: fetch("/api/x", {body:qs.stringify({...})})
+    for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*(?:qs\.)?stringify\s*\((''' + obj + r''')''', text, re.I):
         pairs.append((m.group(1), m.group(2)))
-    # Pattern 5: $.get("/api/x", {...}) / $.post("/api/x", {...})
-    for m in re.finditer(r'''\$\.(?:get|post)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+    # Pattern 5: http.post("/api/x", {...}) / axios.post("/api/x", {...}) / request.get(...)
+    for m in re.finditer(r'''(?:this\.)?(?:http|axios|request|service|api)\.(?:get|post|put|patch|delete)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(''' + obj + r''')''', text, re.I):
         pairs.append((m.group(1), m.group(2)))
-    # Pattern 6: axios.get("/api/x", {params: {...}})
-    for m in re.finditer(r'''axios\.get\s*\(\s*["']([^"']{2,200})["']\s*,\s*\{[^}]*?params\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})''', text, re.I):
+    # Pattern 6: request("/api/x", {params:{...}}) / axios("/api/x", {data:{...}})
+    for m in re.finditer(r'''(?:request|axios)\s*\(\s*["']([^"']{2,200})["']\s*,\s*\{.*?(?:data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
         pairs.append((m.group(1), m.group(2)))
-    # Pattern 7: window.open("/api/x?param="+value) / location.href="/api/x?id="+id
+    # Pattern 7: axios({url:"/api/x", params:{...}}) / uni.request({url:"/api/x", data:{...}})
+    for m in re.finditer(r'''(?:axios|request|uni\.request|wx\.request|\w+\.request)\s*\(\s*\{.*?url\s*:\s*["']([^"']{2,200})["'].*?(?:data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 8: $.ajax({url:"/api/x", data:{...}}) / $.getJSON({url:"/api/x", data:{...}})
+    for m in re.finditer(r'''\$\.(?:ajax|post|get|getJSON)\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["'].*?data\s*:\s*(''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 9: $.get("/api/x", {...}) / $.post("/api/x", {...}) / $.getJSON("/api/x", {...})
+    for m in re.finditer(r'''\$\.(?:get|post|getJSON)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(2)))
+    # Pattern 10: const fd = new FormData(); fd.append("docId", ...); axios.post("/api/x", fd)
+    for m in re.finditer(r'''(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*new\s+FormData\s*\(\s*\)\s*;([\s\S]{0,1500}?)(?:axios|request|http|service)\.post\s*\(\s*["']([^"']{2,200})["']\s*,\s*\1''', text, re.I):
+        fd_name, middle, url_path = m.group(1), m.group(2), m.group(3)
+        keys = re.findall(r'''%s\.append\s*\(\s*["']([a-zA-Z_][a-zA-Z0-9_]{1,40})["']''' % re.escape(fd_name), middle)
+        if keys:
+            pairs.append((url_path, "{" + ",".join(f"{k}:1" for k in keys) + "}"))
+    # Pattern 11: window.open("/api/x?param="+value) / location.href="/api/x?id="+id
     for m in re.finditer(r'''(?:window\.open|location\.href)\s*\(\s*["']([^"']{2,200}\?(?:[a-zA-Z_][a-zA-Z0-9_]*=)["']\s*\+)''', text, re.I):
         url_part = m.group(1).rstrip('"+ ')
         pairs.append((url_part.split("?")[0], ""))
@@ -528,6 +544,8 @@ def param_seed_value(name, seeds):
         return "test"
     if lname in ("format",):
         return "xlsx"
+    if lname in ("filetype", "doctype", "documenttype"):
+        return "pdf"
     if lname in ("status",):
         return "1"
     if lname in ("type", "devicetype"):

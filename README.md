@@ -1,6 +1,6 @@
-# Scanner Pipeline v12
+# Scanner Pipeline v13
 
-JS/API 未授权访问扫描器 — 文件专项 + HTML/JS 静态参数画像 + URL/参数绑定组合 fuzz
+JS/API 未授权访问扫描器 — 文件专项 + HTML/JS 静态参数画像 + URL/参数绑定 + POST body/form fuzz
 
 > **定位**: CTF/攻防赛场景。脚本完成机械工作（JS 提取、API 发现、批量未授权测试），产出报告后由 AI（Claude/GPT）基于结果做精判：选高价值目标、构造正确参数、判断真伪、决定深挖方向。AI 层不在代码内，在操作流程中。
 
@@ -74,6 +74,7 @@ cat results/report.md     # Markdown 报告 (含风险分级)
 python3 tests/v10_realistic_lab.py
 python3 tests/v11_param_bind_lab.py
 python3 tests/v12_request_style_lab.py
+python3 tests/v13_post_body_lab.py
 ```
 
 ## CLI 参数
@@ -81,7 +82,7 @@ python3 tests/v12_request_style_lab.py
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--input` | `/tmp/v7_targets.json` | 目标 JSON 文件 |
-| `--outdir` | `/tmp/v12_scan_results` | 输出目录 |
+| `--outdir` | `/tmp/v13_scan_results` | 输出目录 |
 | `--workers` | 50 | 并发线程数 |
 | `--timeout` | 12 | HTTP 超时(秒) |
 | `--phase2-timeout` | 180 | Phase 2 软超时, 超时目标用 baseline 兜底 |
@@ -115,13 +116,13 @@ python3 tests/v12_request_style_lab.py
 
 > **注意**: 默认模式 (`--full-bypass` 未开启) 下第一个绕过方法命中后立即短路，不测试后续方法。开启 `--full-bypass` 后将收集所有绕过方法的命中结果。
 
-普通 API 端点自动尝试 3 种查询后缀: 无参数 / `?page=1&count=10` / `?page=1&size=10`。JS/Swagger/页面里真实出现的疑似文件接口会启用文件专项参数模板。v12 还会把 HTML/JS 中提取到的 URL 与参数名绑定，在候选目标的 3b 阶段生成组合参数探测。
+普通 API 端点自动尝试 3 种查询后缀: 无参数 / `?page=1&count=10` / `?page=1&size=10`。JS/Swagger/页面里真实出现的疑似文件接口会启用文件专项参数模板。v13 会把 HTML/JS 中提取到的 URL 与参数名绑定，在候选目标的 3b 阶段生成组合参数探测；如果前端请求明确使用 POST JSON body 或表单 body，POST_JSON/POST_FORM 会把绑定参数放进真实请求体，而不是只拼到 query。
 
 > **比赛建议**: 大批资产默认不要开启 `--enable-file-baseline`。文件下载/导出类漏洞优先走 JS 提取到的真实端点 + 静态参数画像，这样请求量更小、噪声更低。只有在小批目标二次追打时，再打开硬编码文件 baseline。
 
-## v12 新增: URL/参数绑定与请求风格解析
+## v13 新增: URL/参数绑定与 POST Body
 
-v12 会从真实前端请求风格中提取 URL 与参数绑定关系，例如:
+v13 会从真实前端请求风格中提取 URL 与参数绑定关系，并记录参数来源是 query、JSON body 还是 form body。例如:
 
 - `axios({ url, data })`
 - `axios.get/post`
@@ -136,7 +137,11 @@ v12 会从真实前端请求风格中提取 URL 与参数绑定关系，例如:
 - `wx.request`
 - `FormData.append + axios.post`
 
-绑定后不会把所有全局参数乱塞到所有接口，而是优先对当前 URL 使用它自己的绑定参数，例如 `/api/user/list` 绑定 `pageNum/pageSize/orgId/keyword` 后生成 `?keyword=test&orgId=1&pageNum=1&pageSize=10`。
+绑定后不会把所有全局参数乱塞到所有接口，而是优先对当前 URL 使用它自己的绑定参数:
+
+- GET/query 风格: `/api/user/list` 绑定 `pageNum/pageSize/orgId/keyword` 后生成 `?keyword=test&orgId=1&pageNum=1&pageSize=10`
+- POST JSON 风格: `fetch("/api/user/search", { body: JSON.stringify({deptId,pageNum}) })` 会发送 JSON body `{"deptId":"1","pageNum":"1"}`
+- POST form 风格: `$.post("/api/doc/preview", {docId,fileType})` 或 `qs.stringify(...)` 会发送 `application/x-www-form-urlencoded` body
 
 参数 fuzz 默认只在候选目标的 3b 深测阶段开启，3a 快筛不做静态参数组合，避免大批量目标请求膨胀。
 

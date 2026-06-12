@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-v12: 文件专项 + HTML/JS静态参数画像 + URL/参数绑定组合fuzz
+v13: 文件专项 + HTML/JS静态参数画像 + URL/参数绑定 + POST body/form fuzz
 融合 JSFinder/Webpack_extract/VueCrack/Packer-Fuzzer 技术
 """
 
 import os, re, json, time, ssl, socket, argparse, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 # ===== CLI =====
-parser = argparse.ArgumentParser(description='JS/API 未授权访问扫描器 v12')
+parser = argparse.ArgumentParser(description='JS/API 未授权访问扫描器 v13')
 parser.add_argument('--input', default='/tmp/v7_targets.json', help='目标JSON文件')
-parser.add_argument('--outdir', default='/tmp/v12_scan_results', help='输出目录')
+parser.add_argument('--outdir', default='/tmp/v13_scan_results', help='输出目录')
 parser.add_argument('--workers', type=int, default=50, help='并发数')
 parser.add_argument('--timeout', type=int, default=12, help='HTTP超时(秒)')
 parser.add_argument('--phase2-timeout', type=int, default=180, help='Phase 2 JS/API提取软超时(秒),超时目标用baseline兜底')
@@ -96,48 +96,71 @@ OBJECT_PARAM_RE = re.compile(r'''["']?([a-zA-Z_][a-zA-Z0-9_]{1,40})["']?\s*:\s*[
 FORM_FIELD_RE = re.compile(r'''(?:name|v-model|prop|field)\s*=\s*["']([a-zA-Z_][a-zA-Z0-9_.\-\[\]]{1,60})["']''', re.I)
 REQUEST_BODY_RE = re.compile(r'''(?:params|data|body)\s*:\s*\{([^{}]{1,2000})\}''', re.I)
 
-def _extract_url_body_pairs(text):
-    """Extract (url, body_text) pairs from common JS patterns, handling nested braces."""
+def _param_source_from_prop(prop, method=""):
+    prop = (prop or "").lower()
+    method = (method or "").lower()
+    if prop == "params":
+        return "query"
+    if prop in ("form", "formdata"):
+        return "form"
+    if method == "get":
+        return "query"
+    if prop in ("data", "body"):
+        return "json"
+    return "json"
+
+def _extract_url_body_sources(text):
+    """Extract (url, body_text, source) from common JS request styles."""
     pairs = []
     obj = r'''\{(?:[^{}]|\{[^{}]*\})*\}'''
     # Pattern 1: request({url:"/api/x", ..., data:{...}})
-    for m in re.finditer(r'''request\s*\(\s*\{\s*url\s*:\s*["']([^"']{2,200})["'].*?(?:data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+    for m in re.finditer(r'''request\s*\(\s*\{\s*url\s*:\s*["']([^"']{2,200})["'].*?(data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(3), _param_source_from_prop(m.group(2))))
     # Pattern 2: fetch("/api/x", {body:JSON.stringify({...})})
     for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*JSON\.stringify\s*\((''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+        pairs.append((m.group(1), m.group(2), "json"))
     # Pattern 3: fetch("/api/x?"+new URLSearchParams({...}))
     for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["']\s*\+\s*new\s+URLSearchParams\s*\((''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+        pairs.append((m.group(1), m.group(2), "query"))
     # Pattern 4: fetch("/api/x", {body:qs.stringify({...})})
     for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*(?:qs\.)?stringify\s*\((''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+        pairs.append((m.group(1), m.group(2), "form"))
+    # Pattern 4b: fetch("/api/x", {body:new URLSearchParams({...})})
+    for m in re.finditer(r'''fetch\s*\(\s*["']([^"']{2,200})["'].*?body\s*:\s*new\s+URLSearchParams\s*\((''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(2), "form"))
     # Pattern 5: http.post("/api/x", {...}) / axios.post("/api/x", {...}) / request.get(...)
-    for m in re.finditer(r'''(?:this\.)?(?:http|axios|request|service|api)\.(?:get|post|put|patch|delete)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+    for m in re.finditer(r'''(?:this\.)?(?:http|axios|request|service|api)\.(get|post|put|patch|delete)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(''' + obj + r''')''', text, re.I):
+        body = m.group(3)
+        source = "query" if re.search(r'''params\s*:''', body, re.I) or m.group(1).lower() == "get" else "json"
+        pairs.append((m.group(2), body, source))
     # Pattern 6: request("/api/x", {params:{...}}) / axios("/api/x", {data:{...}})
-    for m in re.finditer(r'''(?:request|axios)\s*\(\s*["']([^"']{2,200})["']\s*,\s*\{.*?(?:data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+    for m in re.finditer(r'''(?:request|axios)\s*\(\s*["']([^"']{2,200})["']\s*,\s*\{.*?(data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(3), _param_source_from_prop(m.group(2))))
     # Pattern 7: axios({url:"/api/x", params:{...}}) / uni.request({url:"/api/x", data:{...}})
-    for m in re.finditer(r'''(?:axios|request|uni\.request|wx\.request|\w+\.request)\s*\(\s*\{.*?url\s*:\s*["']([^"']{2,200})["'].*?(?:data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+    for m in re.finditer(r'''(?:axios|request|uni\.request|wx\.request|\w+\.request)\s*\(\s*\{.*?url\s*:\s*["']([^"']{2,200})["'].*?(data|params|body)\s*:\s*(''' + obj + r''')''', text, re.I):
+        pairs.append((m.group(1), m.group(3), _param_source_from_prop(m.group(2))))
     # Pattern 8: $.ajax({url:"/api/x", data:{...}}) / $.getJSON({url:"/api/x", data:{...}})
     for m in re.finditer(r'''\$\.(?:ajax|post|get|getJSON)\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["'].*?data\s*:\s*(''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+        source = "query" if re.search(r'''(?:type|method)\s*:\s*["']?GET["']?''', m.group(0), re.I) else "form"
+        pairs.append((m.group(1), m.group(2), source))
     # Pattern 9: $.get("/api/x", {...}) / $.post("/api/x", {...}) / $.getJSON("/api/x", {...})
-    for m in re.finditer(r'''\$\.(?:get|post|getJSON)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(''' + obj + r''')''', text, re.I):
-        pairs.append((m.group(1), m.group(2)))
+    for m in re.finditer(r'''\$\.(get|post|getJSON)\s*\(\s*["']([^"']{2,200})["']\s*,\s*(''' + obj + r''')''', text, re.I):
+        source = "form" if m.group(1).lower() == "post" else "query"
+        pairs.append((m.group(2), m.group(3), source))
     # Pattern 10: const fd = new FormData(); fd.append("docId", ...); axios.post("/api/x", fd)
     for m in re.finditer(r'''(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*new\s+FormData\s*\(\s*\)\s*;([\s\S]{0,1500}?)(?:axios|request|http|service)\.post\s*\(\s*["']([^"']{2,200})["']\s*,\s*\1''', text, re.I):
         fd_name, middle, url_path = m.group(1), m.group(2), m.group(3)
         keys = re.findall(r'''%s\.append\s*\(\s*["']([a-zA-Z_][a-zA-Z0-9_]{1,40})["']''' % re.escape(fd_name), middle)
         if keys:
-            pairs.append((url_path, "{" + ",".join(f"{k}:1" for k in keys) + "}"))
+            pairs.append((url_path, "{" + ",".join(f"{k}:1" for k in keys) + "}", "form"))
     # Pattern 11: window.open("/api/x?param="+value) / location.href="/api/x?id="+id
     for m in re.finditer(r'''(?:window\.open|location\.href)\s*\(\s*["']([^"']{2,200}\?(?:[a-zA-Z_][a-zA-Z0-9_]*=)["']\s*\+)''', text, re.I):
         url_part = m.group(1).rstrip('"+ ')
-        pairs.append((url_part.split("?")[0], ""))
+        pairs.append((url_part.split("?")[0], "", "query"))
     return pairs
+
+def _extract_url_body_pairs(text):
+    return [(url, body) for url, body, _source in _extract_url_body_sources(text)]
 FILE_SEED_RE = re.compile(r'''["']([a-zA-Z0-9_\-./]{1,120}\.(?:pdf|doc|docx|xls|xlsx|csv|zip|rar|7z|jpg|jpeg|png|gif|txt))["']''', re.I)
 NUMERIC_ID_RE = re.compile(r'''(?:id|Id|ID|fileId|docId|recordId|userId|deptId|orgId|attachId)\s*[:=]\s*["']?(\d{1,12})["']?''')
 COMMON_PARAM_HINTS = {
@@ -163,7 +186,7 @@ FAST_BYPASS = [
 FULL_BYPASS = FAST_BYPASS + [
     ("GET_empty_bearer","GET",None,None,{"Authorization":"Bearer "}),
     ("GET_admin_token","GET",None,None,{"Authorization":"Bearer admin-token"}),
-    ("POST_FORM_no_auth","POST","application/x-www-form-urlencoded",lambda p: "&".join(f"{k}={v}" for k,v in p.items()).encode(),{}),
+    ("POST_FORM_no_auth","POST","application/x-www-form-urlencoded",lambda p: urlencode(p).encode(),{}),
     ("POST_JWT_none","POST","application/json",lambda p: json.dumps(p).encode(),{"Authorization":"Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."}),
 ]
 
@@ -419,7 +442,7 @@ def file_query_suffixes(path):
     return suffixes + probes
 
 def empty_param_profile():
-    return {"names": set(), "seeds": set(), "file_seeds": set(), "api_params": {}}
+    return {"names": set(), "seeds": set(), "file_seeds": set(), "api_params": {}, "api_param_sources": {}}
 
 def normalize_param_name(name):
     name = (name or "").strip().strip("[]")
@@ -429,7 +452,7 @@ def normalize_param_name(name):
         return ""
     return name
 
-def add_param_name(profile, name, api_path=None):
+def add_param_name(profile, name, api_path=None, source="query"):
     name = normalize_param_name(name)
     if not name:
         return
@@ -438,6 +461,8 @@ def add_param_name(profile, name, api_path=None):
         api_path = api_path.split("?")[0].split("#")[0].rstrip("/")
         if api_path:
             profile["api_params"].setdefault(api_path, set()).add(name)
+            source = source if source in ("query", "json", "form") else "query"
+            profile.setdefault("api_param_sources", {}).setdefault(api_path, {}).setdefault(source, set()).add(name)
 
 def add_seed(profile, value, file_hint=False):
     value = str(value or "").strip().strip('"\'')
@@ -458,6 +483,10 @@ def merge_param_profiles(dst, src):
     dst["file_seeds"].update(src.get("file_seeds", set()))
     for path, names in src.get("api_params", {}).items():
         dst["api_params"].setdefault(path, set()).update(names)
+    for path, sources in src.get("api_param_sources", {}).items():
+        dst_sources = dst.setdefault("api_param_sources", {}).setdefault(path, {})
+        for source, names in sources.items():
+            dst_sources.setdefault(source, set()).update(names)
     for api in src.get("_apis_from_params", set()):
         dst.setdefault("_apis_from_params", set()).add(api)
     return dst
@@ -480,10 +509,10 @@ def extract_param_profile(content):
     for m in NUMERIC_ID_RE.finditer(sample):
         add_seed(profile, m.group(1))
     # URL+body 配对提取: 将参数绑定到具体URL
-    for url_path, body_text in _extract_url_body_pairs(sample):
+    for url_path, body_text, source in _extract_url_body_sources(sample):
         if url_path and body_text:
             for key, value in OBJECT_PARAM_RE.findall(body_text):
-                add_param_name(profile, key, api_path=url_path)
+                add_param_name(profile, key, api_path=url_path, source=source)
                 add_seed(profile, value)
     # 全局 body 提取 (无URL上下文)
     for m in REQUEST_BODY_RE.finditer(sample):
@@ -518,6 +547,15 @@ def bound_param_names(profile, path):
     for candidate in path_param_candidates(path):
         bound = profile.get("api_params", {}).get(candidate, set())
         for name in sorted(bound):
+            if name not in names:
+                names.append(name)
+    return names
+
+def bound_param_names_by_source(profile, path, source):
+    names = []
+    for candidate in path_param_candidates(path):
+        sources = profile.get("api_param_sources", {}).get(candidate, {})
+        for name in sorted(sources.get(source, set())):
             if name not in names:
                 names.append(name)
     return names
@@ -582,19 +620,27 @@ def param_seed_value(name, seeds):
             return seed
     return "1"
 
+def param_seed_pool(profile, path):
+    seeds = ["1", "2", "10", "100", "test"]
+    dynamic = [s for s in sorted(profile.get("seeds", set())) if not s.startswith("/") and "://" not in s][:20]
+    file_dynamic = sorted(profile.get("file_seeds", set()))[:20]
+    if is_file_endpoint(path):
+        return list(dict.fromkeys(file_dynamic + FILE_SEED_VALUES + dynamic + seeds))
+    return list(dict.fromkeys(dynamic + seeds))
+
+def build_param_payload(names, seeds, max_names=6):
+    payload = {}
+    for name in names[:max_names]:
+        payload[name] = param_seed_value(name, seeds)
+    return payload
+
 def param_query_suffixes(path, profile):
     if not should_param_probe(path, profile):
         return []
     names = prioritized_param_names(profile, path)
     if not names:
         return []
-    seeds = ["1", "2", "10", "100", "test"]
-    dynamic = [s for s in sorted(profile.get("seeds", set())) if not s.startswith("/") and "://" not in s][:20]
-    file_dynamic = sorted(profile.get("file_seeds", set()))[:20]
-    if is_file_endpoint(path):
-        seeds = list(dict.fromkeys(file_dynamic + FILE_SEED_VALUES + dynamic + seeds))
-    else:
-        seeds = list(dict.fromkeys(dynamic + seeds))
+    seeds = param_seed_pool(profile, path)
     probes = []
     # 组合fuzz只使用URL绑定参数, 避免全局参数池污染真实前端流量形态。
     bound_names = bound_param_names(profile, path)
@@ -619,6 +665,39 @@ def query_suffixes(path, profile=None, allow_param_probe=True):
             if qs not in suffixes:
                 suffixes.append(qs)
     return suffixes
+
+def body_param_payloads(path, profile, body_type, allow_param_probe=True):
+    if not allow_param_probe or not should_param_probe(path, profile or {}):
+        return []
+    profile = profile or {}
+    seeds = param_seed_pool(profile, path)
+    names = bound_param_names_by_source(profile, path, body_type)
+    if not names and body_type == "form":
+        names = bound_param_names_by_source(profile, path, "json")
+    if not names and body_type == "json":
+        names = bound_param_names_by_source(profile, path, "form")
+    if not names:
+        return []
+    payloads = []
+    combo = build_param_payload(names, seeds)
+    if combo:
+        payloads.append(combo)
+    for name in names:
+        payloads.append({name: param_seed_value(name, seeds)})
+        if len(payloads) >= max(2, min(args.param_max_probes, 8)):
+            break
+    return payloads
+
+def request_variants(path, method, content_type, body_func, param_profile=None, allow_param_probe=True):
+    if method in ("POST", "PUT", "PATCH") and body_func:
+        body_type = "form" if content_type == "application/x-www-form-urlencoded" else "json"
+        variants = [("", {"page": "1", "size": "10"})]
+        for payload in body_param_payloads(path, param_profile or {}, body_type, allow_param_probe):
+            item = ("", payload)
+            if item not in variants:
+                variants.append(item)
+        return variants
+    return [(qs, None) for qs in query_suffixes(path, param_profile, allow_param_probe=allow_param_probe)]
 
 def extract_apis(js_content):
     apis = set()
@@ -891,13 +970,13 @@ def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=Non
     if not clean: return []
     url_base = urljoin(base_url, clean)
     findings = []
-    for qs in query_suffixes(clean, param_profile, allow_param_probe=allow_param_probe):
-        url = url_base + qs
-        for name, method, ct, bf, headers in bypass_tests:
+    for name, method, ct, bf, headers in bypass_tests:
+        for qs, payload in request_variants(clean, method, ct, bf, param_profile, allow_param_probe=allow_param_probe):
+            url = url_base + qs
             try:
                 data = None
                 if method in ("POST","PUT","PATCH") and bf:
-                    data = bf({"page":1,"size":10})
+                    data = bf(payload or {"page":"1","size":"10"})
                 h = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
                 h.update(headers)
                 if data and ct: h["Content-Type"] = ct
@@ -1086,7 +1165,7 @@ def run_task_pool(tasks, worker_count, timeout, label, fn, on_result, progress_e
 # ===== 主流程 =====
 def main():
     print("="*60)
-    print(f"v12: URL参数绑定+请求风格增强 | {'全量绕过' if args.full_bypass else '命中断路'} | 风险分级 | Markdown报告")
+    print(f"v13: URL参数绑定+POST body/form增强 | {'全量绕过' if args.full_bypass else '命中断路'} | 风险分级 | Markdown报告")
     if args.debug: print(f"  debug=ON workers={WORKERS} timeout={HTTP_TIMEOUT}s")
     print("="*60)
 
@@ -1390,7 +1469,7 @@ def main():
 
     # Markdown
     file_leak_count = stats["file_leaks"]
-    md = [f"# 扫描报告 v12\n\n**时间**: {report['scan_time']} | **目标**: {report['targets']} | **存活**: {report['live']} | **API**: {report['apis']} | **漏洞**: {report['vulnerable']} | **文件类发现**: {file_leak_count}\n"]
+    md = [f"# 扫描报告 v13\n\n**时间**: {report['scan_time']} | **目标**: {report['targets']} | **存活**: {report['live']} | **API**: {report['apis']} | **漏洞**: {report['vulnerable']} | **文件类发现**: {file_leak_count}\n"]
     md.append(
         "\n## 统计口径\n\n"
         f"- 原始发现: {stats['raw_findings']}\n"

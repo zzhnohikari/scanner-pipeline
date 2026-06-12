@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild v12 report.json/report.md from checkpoint JSON files in an outdir."""
+"""Rebuild v13 report.json/report.md from checkpoint JSON files in an outdir."""
 
 import argparse
 import importlib.util
@@ -22,7 +22,7 @@ def load_scanner(root):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Rebuild v12 reports from checkpoint JSON files")
+    parser = argparse.ArgumentParser(description="Rebuild v13 reports from checkpoint JSON files")
     parser.add_argument("--outdir", required=True)
     args, scanner_args = parser.parse_known_args()
 
@@ -59,7 +59,7 @@ def main():
     (outdir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     md = [
-        "# 扫描报告 v12 (rebuilt)\n",
+        "# 扫描报告 v13 (rebuilt)\n",
         "## 统计口径\n",
         f"- 漏洞目标: {len(vulnerable)}",
         f"- 原始发现: {stats['raw_findings']}",

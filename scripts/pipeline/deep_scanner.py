@@ -473,6 +473,13 @@ def add_seed(profile, value, file_hint=False):
         return
     if not file_hint and (value.startswith("/") or "://" in value):
         return
+    # Unquoted JS identifiers such as deptId/kw/docId are variable names, not useful seed values.
+    if not file_hint and re.match(r"^[a-zA-Z_$][a-zA-Z0-9_$]{1,40}$", value):
+        if value.lower() not in ("admin", "test", "demo", "default", "camera", "rtsp", "pdf", "xlsx", "docx", "jpg", "png"):
+            return
+    if not file_hint and "." in value:
+        if not re.search(r"\.(?:pdf|doc|docx|xls|xlsx|csv|zip|rar|7z|jpg|jpeg|png|gif|txt)$", value, re.I):
+            return
     if file_hint or re.search(r"\.(?:pdf|doc|docx|xls|xlsx|csv|zip|rar|7z|jpg|jpeg|png|gif|txt)$", value, re.I):
         profile["file_seeds"].add(value)
     elif re.match(r"^[a-zA-Z0-9_\-./:@]{1,120}$", value):

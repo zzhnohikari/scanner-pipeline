@@ -167,6 +167,8 @@ def main():
             assert ("/prod-api/form/doc/preview", "POST", "POST_FORM_no_auth") in by_path_method, "jQuery form doc endpoint missing"
             assert ("/prod-api/form/attach/download", "POST", "POST_FORM_no_auth") in by_path_method, "FormData-style form endpoint missing"
             assert not any("query rejected" in fi.get("raw", "") for fi in findings), "query-only rejection was reported as finding"
+            assert not any("attachId=deptId" in fi.get("url", "") for fi in findings), "JS variable name leaked into seed values"
+            assert not any("attachId=page.pageNum" in fi.get("url", "") for fi in findings), "JS member expression leaked into seed values"
             print("BODY LAB PASS")
             print(f"targets={report.get('targets')} live={report.get('live')} vulnerable={report.get('vulnerable')} findings={len(findings)}")
             for fi in findings[:10]:

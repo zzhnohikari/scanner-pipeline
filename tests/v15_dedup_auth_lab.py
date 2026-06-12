@@ -43,12 +43,18 @@ class Handler(BaseHTTPRequestHandler):
             js = '''
             fetch("/api/user/list?page=1&size=10");
             fetch("/api/auth/expired");
+            fetch("/api/auth/permission");
+            fetch("/api/auth/data-error");
             '''
             return self.send_body(200, js, "application/javascript")
         if parsed.path == "/api/user/list":
             return self.send_json({"code": 0, "data": [{"userId": 1, "phone": "13800001234"}]})
         if parsed.path == "/api/auth/expired":
             return self.send_json({"code": 0, "msg": "登录已过期，请重新登录", "data": {"error": "无权限访问"}})
+        if parsed.path == "/api/auth/permission":
+            return self.send_json({"message": "Access Denied", "data": {"phone": "13800000000"}})
+        if parsed.path == "/api/auth/data-error":
+            return self.send_json({"msg": "success", "data": {"error": "无权限访问", "phone": "13800000001"}})
         return self.send_json({"code": 404}, status=404)
 
     def do_POST(self):
@@ -57,6 +63,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"code": 0, "data": [{"userId": 1, "phone": "13800001234"}]})
         if parsed.path == "/api/auth/expired":
             return self.send_json({"code": 0, "msg": "无权限访问", "data": {"error": "permission denied"}})
+        if parsed.path == "/api/auth/permission":
+            return self.send_json({"message": "Access Denied", "data": {"phone": "13800000000"}})
+        if parsed.path == "/api/auth/data-error":
+            return self.send_json({"msg": "success", "data": {"error": "无权限访问", "phone": "13800000001"}})
         return self.send_json({"code": 404}, status=404)
 
 
@@ -104,10 +114,12 @@ def main():
             findings = flatten(report)
             user_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/user/list"]
             auth_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/auth/expired"]
+            permission_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path in ("/api/auth/permission", "/api/auth/data-error")]
             assert len(user_findings) == 1, f"user/list should aggregate to 1 finding, got {len(user_findings)}"
-            assert user_findings[0].get("variant_count", 0) > 1, "aggregated finding should preserve variant_count"
+            assert user_findings[0].get("variant_count", 0) > len(user_findings[0].get("sample_urls", [])), "variant_count should not be capped by sample_urls"
             assert len(user_findings[0].get("tests", [])) >= 2, "aggregated finding should preserve bypass tests"
             assert not auth_findings, "auth failure response should not be reported"
+            assert not permission_findings, "nested/case-insensitive auth failure response should not be reported"
             assert report["stats"].get("merged_variants", 0) > 0, "merged variant stat missing"
             print("DEDUP AUTH LAB PASS")
             print(f"targets={report.get('targets')} live={report.get('live')} vulnerable={report.get('vulnerable')} findings={len(findings)} merged={report['stats'].get('merged_variants')}")

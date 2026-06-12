@@ -1023,7 +1023,7 @@ def check_response(body, url, method, test_name, status_code=None):
         code = str(code_val)
         msg = str(parsed.get("msg","") or parsed.get("message",""))
         if code in ("10031","401","403","500002","40001"): return None
-        if any(p in msg for p in AUTH_FAIL_MSGS): return None
+        if is_auth_failure_json(parsed): return None
         d = parsed.get("data")
         data_source = d
         if not data_source:
@@ -1060,6 +1060,25 @@ def check_response(body, url, method, test_name, status_code=None):
         f = {"url":url,"method":method,"test":test_name,"attack_path_intel":True,"risk":"MEDIUM","raw":body[:500]}
         return f
     return None
+
+def text_has_auth_failure(text):
+    text = str(text or "")
+    lowered = text.lower()
+    return any(str(p).lower() in lowered for p in AUTH_FAIL_MSGS)
+
+def is_auth_failure_json(parsed):
+    if not isinstance(parsed, dict):
+        return False
+    for key in ("msg", "message", "error", "errorMsg", "errorMessage", "detail", "reason"):
+        if key in parsed and text_has_auth_failure(parsed.get(key)):
+            return True
+    for parent_key in ("data", "result", "payload"):
+        parent = parsed.get(parent_key)
+        if isinstance(parent, dict):
+            for key in ("msg", "message", "error", "errorMsg", "errorMessage", "detail", "reason"):
+                if key in parent and text_has_auth_failure(parent.get(key)):
+                    return True
+    return False
 
 # ===== API 测试（双模式） =====
 def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=None, allow_param_probe=True):
@@ -1164,7 +1183,7 @@ def merge_finding_details(dst, src):
         urls.append(src.get("url"))
     if urls:
         dst["sample_urls"] = urls[:8]
-        dst["variant_count"] = max(int(dst.get("variant_count") or len(urls)), len(urls))
+    dst["variant_count"] = int(dst.get("variant_count") or 1) + int(src.get("variant_count") or 1)
     if int(src.get("data_count") or 0) > int(dst.get("data_count") or 0):
         dst["data_count"] = src.get("data_count")
     if src.get("credential_leak"):

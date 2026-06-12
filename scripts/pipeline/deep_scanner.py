@@ -1231,13 +1231,37 @@ def finding_key(fi):
         normalized_endpoint(fi.get("url", "")),
         str(fi.get("risk", "")),
         str(fi.get("code", "")),
-        str(fi.get("data_count", "")),
         ",".join(sorted(map(str, fi.get("data_keys", []))))[:200],
         "cred" if fi.get("credential_leak") else "",
         "intel" if fi.get("attack_path_intel") else "",
     ])
 
+def risk_rank(risk):
+    return {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}.get(str(risk or "").upper(), 0)
+
+def finding_value_score(fi):
+    score = risk_rank(fi.get("risk")) * 1000
+    score += int(fi.get("data_count") or 0)
+    score += len(fi.get("data_keys") or []) * 5
+    if fi.get("credential_leak"):
+        score += 500
+    if fi.get("file_leak"):
+        score += int(fi.get("file_score") or 0) * 20
+    return score
+
 def merge_finding_details(dst, src):
+    if finding_value_score(src) > finding_value_score(dst):
+        keep = {
+            "tests": dst.get("tests"),
+            "methods": dst.get("methods"),
+            "sample_urls": dst.get("sample_urls"),
+            "variant_count": dst.get("variant_count"),
+        }
+        dst.clear()
+        dst.update(src)
+        for key, value in keep.items():
+            if value is not None:
+                dst[key] = value
     tests = set(dst.get("tests") or ([dst.get("test")] if dst.get("test") else []))
     if src.get("test"):
         tests.add(src.get("test"))
@@ -1300,13 +1324,17 @@ def high_value_finding(fi):
 
 def report_stats(vulnerable):
     all_findings = [fi for v in vulnerable for fi in v.get("findings", [])]
+    raw_events = sum(int(fi.get("variant_count") or 1) for fi in all_findings)
+    aggregated_findings = len(all_findings)
     unique_endpoint_keys = {normalized_endpoint(fi.get("url", "")) for fi in all_findings}
     data_findings = [fi for fi in all_findings if fi.get("data_count") or fi.get("data_keys")]
     file_findings = [fi for fi in all_findings if fi.get("file_leak")]
     public_downloads = [fi for fi in file_findings if fi.get("public_download_intel")]
-    merged_variants = sum(max(0, int(fi.get("variant_count") or 1) - 1) for fi in all_findings)
+    merged_variants = max(0, raw_events - aggregated_findings)
     return {
-        "raw_findings": len(all_findings),
+        "raw_events": raw_events,
+        "aggregated_findings": aggregated_findings,
+        "raw_findings": raw_events,
         "unique_endpoints": len(unique_endpoint_keys),
         "merged_variants": merged_variants,
         "data_findings": len(data_findings),
@@ -1324,6 +1352,7 @@ def write_target_result(t):
     if not findings:
         return
     t["finding_count"] = len(findings)
+    t["raw_event_count"] = sum(int(fi.get("variant_count") or 1) for fi in findings)
     out = {k: v for k, v in t.items() if k not in ("_f", "_f3a_real", "_deep", "_seen_tasks")}
     with open(os.path.join(OUTDIR, target_filename(t["base"])), "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=2, default=str)
@@ -1339,6 +1368,7 @@ def load_checkpoint_results():
                 item = json.load(f)
             if item.get("base") and item.get("findings"):
                 item["finding_count"] = len(item.get("findings", []))
+                item["raw_event_count"] = sum(int(fi.get("variant_count") or 1) for fi in item.get("findings", []))
                 items.append(item)
         except Exception as e:
             log.debug(f"Load checkpoint {path} failed: {e}")
@@ -1702,7 +1732,9 @@ def main():
             all_f = t.get("findings", [])
             if all_f:
                 unique = merge_findings([], all_f)
-                t["findings"] = unique; t["finding_count"] = len(unique)
+                t["findings"] = unique
+                t["finding_count"] = len(unique)
+                t["raw_event_count"] = sum(int(fi.get("variant_count") or 1) for fi in unique)
                 write_target_result(t)
                 vulnerable.append(t)
                 print(f"\n  [!] {t['base']} | {t['title'][:50]}")
@@ -1723,9 +1755,16 @@ def main():
     vulnerable = sorted(by_base.values(), key=lambda x: x.get("base", ""))
     stats = report_stats(vulnerable)
     report = {"scan_time":time.strftime("%Y-%m-%d %H:%M:%S"),"targets":len(targets),"live":len(live),
-              "apis":len(api_results),"vulnerable":len(vulnerable),"stats":stats,"findings":[]}
+              "apis":len(api_results),"vulnerable":len(vulnerable),
+              "raw_events":stats["raw_events"],"aggregated_findings":stats["aggregated_findings"],
+              "stats":stats,"findings":[]}
     for v in vulnerable:
-        report["findings"].append({"url":v["base"],"title":v.get("title",""),"findings":v.get("findings",[])})
+        report["findings"].append({
+            "url":v["base"],"title":v.get("title",""),
+            "raw_events":v.get("raw_event_count", sum(int(fi.get("variant_count") or 1) for fi in v.get("findings", []))),
+            "aggregated_findings":v.get("finding_count", len(v.get("findings", []))),
+            "findings":v.get("findings",[]),
+        })
     with open(os.path.join(OUTDIR,"report.json"),"w") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=str)
 
@@ -1734,18 +1773,21 @@ def main():
     md = [f"# 扫描报告 v13\n\n**时间**: {report['scan_time']} | **目标**: {report['targets']} | **存活**: {report['live']} | **API**: {report['apis']} | **漏洞**: {report['vulnerable']} | **文件类发现**: {file_leak_count}\n"]
     md.append(
         "\n## 统计口径\n\n"
-        f"- 原始发现: {stats['raw_findings']}\n"
-        f"- 去重端点: {stats['unique_endpoints']}\n"
+        f"- raw_events: {stats['raw_events']}（原始命中事件口径，含同端点多 query / 多绕过命中）\n"
+        f"- aggregated_findings: {stats['aggregated_findings']}（聚合后报告口径，每条保留最高价值代表命中）\n"
+        f"- unique_endpoints: {stats['unique_endpoints']}（按 URL path 去重端点）\n"
+        f"- merged_variants: {stats['merged_variants']}（被聚合进代表 finding 的命中事件）\n"
         f"- 数据类发现: {stats['data_findings']} / 去重数据端点: {stats['unique_data_endpoints']}\n"
         f"- 高价值发现: {stats['high_value_findings']}\n"
         f"- 文件类发现: {stats['file_leaks']} / 公开下载情报: {stats['public_download_intel']}\n"
     )
     if vulnerable:
-        md.append("\n## 漏洞汇总\n\n| # | 风险 | URL | 标题 | 发现数 |\n|---|------|-----|------|--------|")
+        md.append("\n## 漏洞汇总\n\n| # | 风险 | URL | 标题 | raw_events | aggregated_findings |\n|---|------|-----|------|------------|---------------------|")
         for i, v in enumerate(vulnerable):
             risks = [fi.get('risk','LOW') for fi in v.get('findings',[])]
             top = 'CRITICAL' if 'CRITICAL' in risks else 'HIGH' if 'HIGH' in risks else 'MEDIUM' if 'MEDIUM' in risks else 'LOW'
-            md.append(f"| {i+1} | {top} | {v['base']} | {v.get('title','')[:30]} | {v.get('finding_count',0)} |")
+            raw_event_count = v.get("raw_event_count", sum(int(fi.get("variant_count") or 1) for fi in v.get("findings", [])))
+            md.append(f"| {i+1} | {top} | {v['base']} | {v.get('title','')[:30]} | {raw_event_count} | {v.get('finding_count',0)} |")
         md.append("\n## 详细发现\n")
         for i, v in enumerate(vulnerable):
             md.append(f"### [{i+1}] {v['base']} — {v.get('title','')}")

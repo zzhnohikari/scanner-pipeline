@@ -49,6 +49,11 @@ class Handler(BaseHTTPRequestHandler):
             '''
             return self.send_body(200, js, "application/javascript")
         if parsed.path == "/api/user/list":
+            if "size=10" in self.path:
+                return self.send_json({"code": 0, "data": [
+                    {"userId": 1, "phone": "13800001234"},
+                    {"userId": 2, "phone": "13800005678"},
+                ]})
             return self.send_json({"code": 0, "data": [{"userId": 1, "phone": "13800001234"}]})
         if parsed.path == "/api/auth/expired":
             return self.send_json({"code": 0, "msg": "登录已过期，请重新登录", "data": {"error": "无权限访问"}})
@@ -121,11 +126,15 @@ def main():
             auth_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/auth/expired"]
             permission_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path in ("/api/auth/permission", "/api/auth/data-error", "/api/auth/deep-error")]
             assert len(user_findings) == 1, f"user/list should aggregate to 1 finding, got {len(user_findings)}"
+            assert user_findings[0].get("data_count") == 2, "aggregated representative should keep highest-value response"
             assert user_findings[0].get("variant_count", 0) > len(user_findings[0].get("sample_urls", [])), "variant_count should not be capped by sample_urls"
             assert len(user_findings[0].get("tests", [])) >= 2, "aggregated finding should preserve bypass tests"
             assert not auth_findings, "auth failure response should not be reported"
             assert not permission_findings, "nested/case-insensitive auth failure response should not be reported"
             assert report["stats"].get("merged_variants", 0) > 0, "merged variant stat missing"
+            assert report.get("raw_events") == report["stats"].get("raw_events"), "top-level raw_events should match stats"
+            assert report.get("aggregated_findings") == report["stats"].get("aggregated_findings"), "top-level aggregated_findings should match stats"
+            assert report["stats"].get("raw_events", 0) > report["stats"].get("aggregated_findings", 0), "raw_events should keep the pre-aggregation event count"
             print("DEDUP AUTH LAB PASS")
             print(f"targets={report.get('targets')} live={report.get('live')} vulnerable={report.get('vulnerable')} findings={len(findings)} merged={report['stats'].get('merged_variants')}")
             for fi in findings[:8]:

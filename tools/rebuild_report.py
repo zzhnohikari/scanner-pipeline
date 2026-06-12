@@ -40,6 +40,7 @@ def main():
             continue
         item["findings"] = findings
         item["finding_count"] = len(findings)
+        item["raw_event_count"] = sum(int(fi.get("variant_count") or 1) for fi in findings)
         vulnerable.append(item)
         path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -50,9 +51,17 @@ def main():
         "live": None,
         "apis": None,
         "vulnerable": len(vulnerable),
+        "raw_events": stats["raw_events"],
+        "aggregated_findings": stats["aggregated_findings"],
         "stats": stats,
         "findings": [
-            {"url": v["base"], "title": v.get("title", ""), "findings": v.get("findings", [])}
+            {
+                "url": v["base"],
+                "title": v.get("title", ""),
+                "raw_events": v.get("raw_event_count", sum(int(fi.get("variant_count") or 1) for fi in v.get("findings", []))),
+                "aggregated_findings": v.get("finding_count", len(v.get("findings", []))),
+                "findings": v.get("findings", []),
+            }
             for v in vulnerable
         ],
     }
@@ -62,21 +71,23 @@ def main():
         "# 扫描报告 v13 (rebuilt)\n",
         "## 统计口径\n",
         f"- 漏洞目标: {len(vulnerable)}",
-        f"- 原始发现: {stats['raw_findings']}",
-        f"- 去重端点: {stats['unique_endpoints']}",
-        f"- 聚合变体: {stats.get('merged_variants', 0)}",
+        f"- raw_events: {stats['raw_events']}（原始命中事件口径，含同端点多 query / 多绕过命中）",
+        f"- aggregated_findings: {stats['aggregated_findings']}（聚合后报告口径，每条保留最高价值代表命中）",
+        f"- unique_endpoints: {stats['unique_endpoints']}（按 URL path 去重端点）",
+        f"- merged_variants: {stats.get('merged_variants', 0)}（被聚合进代表 finding 的命中事件）",
         f"- 数据类发现: {stats['data_findings']} / 去重数据端点: {stats['unique_data_endpoints']}",
         f"- 高价值发现: {stats['high_value_findings']}",
         f"- 文件类发现: {stats['file_leaks']} / 公开下载情报: {stats['public_download_intel']}",
         "\n## 漏洞汇总\n",
-        "| # | URL | 标题 | 发现数 |",
-        "|---|-----|------|--------|",
+        "| # | URL | 标题 | raw_events | aggregated_findings |",
+        "|---|-----|------|------------|---------------------|",
     ]
     for i, v in enumerate(vulnerable, 1):
-        md.append(f"| {i} | {v['base']} | {v.get('title','')[:30]} | {v.get('finding_count',0)} |")
+        raw_event_count = v.get("raw_event_count", sum(int(fi.get("variant_count") or 1) for fi in v.get("findings", [])))
+        md.append(f"| {i} | {v['base']} | {v.get('title','')[:30]} | {raw_event_count} | {v.get('finding_count',0)} |")
     (outdir / "report.md").write_text("\n".join(md), encoding="utf-8")
 
-    print(f"rebuilt: targets={len(vulnerable)} raw={stats['raw_findings']} unique={stats['unique_endpoints']} files={stats['file_leaks']} public={stats['public_download_intel']}")
+    print(f"rebuilt: targets={len(vulnerable)} raw_events={stats['raw_events']} aggregated={stats['aggregated_findings']} unique={stats['unique_endpoints']} files={stats['file_leaks']} public={stats['public_download_intel']}")
 
 
 if __name__ == "__main__":

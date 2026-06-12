@@ -10,31 +10,36 @@ from urllib.parse import urlparse, urljoin, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-# ===== CLI =====
-parser = argparse.ArgumentParser(description='JS/API 未授权访问扫描器 v13')
-parser.add_argument('--input', default='/tmp/v7_targets.json', help='目标JSON文件')
-parser.add_argument('--outdir', default='/tmp/v13_scan_results', help='输出目录')
-parser.add_argument('--workers', type=int, default=50, help='并发数')
-parser.add_argument('--timeout', type=int, default=12, help='HTTP超时(秒)')
-parser.add_argument('--phase2-timeout', type=int, default=180, help='Phase 2 JS/API提取软超时(秒),超时目标用baseline兜底')
-parser.add_argument('--phase3a-timeout', type=int, default=240, help='Phase 3a 快筛软超时(秒),超时后先进入候选/补筛流程')
-parser.add_argument('--rescue-timeout', type=int, default=180, help='Phase 3a baseline补筛软超时(秒)')
-parser.add_argument('--disable-rescue-baseline', action='store_true', help='关闭Phase 3a baseline补筛')
-parser.add_argument('--phase3b-layer-timeout', type=int, default=300, help='Phase 3b 每个分层软超时(秒)')
-parser.add_argument('--limit', type=int, default=0, help='限制目标数量,0=全部')
-parser.add_argument('--dry-run', action='store_true', help='只提取API,不测试')
-parser.add_argument('--full-bypass', action='store_true', help='收集所有绕过方法(默认命中断路)')
-parser.add_argument('--debug', action='store_true', help='调试日志')
-parser.add_argument('--no-proxy', action='store_true', help='绕过系统代理(ClashX等)')
-parser.add_argument('--fresh', action='store_true', help='扫描前清理输出目录中的旧JSON报告/checkpoint')
-parser.add_argument('--resume', action='store_true', help='报告阶段合并输出目录中的历史checkpoint(默认只统计本轮结果)')
-parser.add_argument('--disable-file-hunter', action='store_true', help='关闭下载/预览/导出接口专项检测')
-parser.add_argument('--enable-file-baseline', action='store_true', help='启用硬编码文件下载baseline路径(默认关闭)')
-parser.add_argument('--file-max-probes', type=int, default=36, help='每个疑似文件接口最多探测次数')
-parser.add_argument('--disable-param-harvest', action='store_true', help='关闭HTML/JS静态参数画像')
-parser.add_argument('--param-max-probes', type=int, default=12, help='每个接口最多静态参数模板探测次数')
-parser.add_argument('--param-probe-mode', choices=['targeted','broad'], default='targeted', help='静态参数探测模式: targeted仅高价值接口,broad全部接口')
-args = parser.parse_args()
+def build_parser():
+    parser = argparse.ArgumentParser(description='JS/API 未授权访问扫描器 v13')
+    parser.add_argument('--input', default='/tmp/v7_targets.json', help='目标JSON文件')
+    parser.add_argument('--outdir', default='/tmp/v13_scan_results', help='输出目录')
+    parser.add_argument('--workers', type=int, default=50, help='并发数')
+    parser.add_argument('--timeout', type=int, default=12, help='HTTP超时(秒)')
+    parser.add_argument('--phase2-timeout', type=int, default=180, help='Phase 2 JS/API提取软超时(秒),超时目标用baseline兜底')
+    parser.add_argument('--phase3a-timeout', type=int, default=240, help='Phase 3a 快筛软超时(秒),超时后先进入候选/补筛流程')
+    parser.add_argument('--rescue-timeout', type=int, default=180, help='Phase 3a baseline补筛软超时(秒)')
+    parser.add_argument('--disable-rescue-baseline', action='store_true', help='关闭Phase 3a baseline补筛')
+    parser.add_argument('--phase3b-layer-timeout', type=int, default=300, help='Phase 3b 每个分层软超时(秒)')
+    parser.add_argument('--limit', type=int, default=0, help='限制目标数量,0=全部')
+    parser.add_argument('--dry-run', action='store_true', help='只提取API,不测试')
+    parser.add_argument('--full-bypass', action='store_true', help='收集所有绕过方法(默认命中断路)')
+    parser.add_argument('--debug', action='store_true', help='调试日志')
+    parser.add_argument('--no-proxy', action='store_true', help='绕过系统代理(ClashX等)')
+    parser.add_argument('--fresh', action='store_true', help='扫描前清理输出目录中的旧JSON报告/checkpoint')
+    parser.add_argument('--resume', action='store_true', help='报告阶段合并输出目录中的历史checkpoint(默认只统计本轮结果)')
+    parser.add_argument('--disable-file-hunter', action='store_true', help='关闭下载/预览/导出接口专项检测')
+    parser.add_argument('--enable-file-baseline', action='store_true', help='启用硬编码文件下载baseline路径(默认关闭)')
+    parser.add_argument('--file-max-probes', type=int, default=36, help='每个疑似文件接口最多探测次数')
+    parser.add_argument('--disable-param-harvest', action='store_true', help='关闭HTML/JS静态参数画像')
+    parser.add_argument('--param-max-probes', type=int, default=12, help='每个接口最多静态参数模板探测次数')
+    parser.add_argument('--param-probe-mode', choices=['targeted','broad'], default='targeted', help='静态参数探测模式: targeted仅高价值接口,broad全部接口')
+    return parser
+
+def parse_cli(argv=None):
+    return build_parser().parse_args(argv)
+
+args = parse_cli() if __name__ == "__main__" else parse_cli([])
 
 log = logging.getLogger('scanner')
 log.addHandler(logging.StreamHandler())
@@ -44,8 +49,9 @@ TCP_TIMEOUT = 1.5; HTTP_TIMEOUT = args.timeout; API_TIMEOUT = max(6, args.timeou
 WORKERS = args.workers; SSL_RETRIES = 2; OUTDIR = args.outdir
 os.makedirs(OUTDIR, exist_ok=True)
 if args.fresh:
+    checkpoint_re = re.compile(r'^(?:https?___|[a-zA-Z0-9_.-]+_\\d+).*\\.json$')
     for name in os.listdir(OUTDIR):
-        if name.endswith((".json", ".md")):
+        if name in ("report.json", "report.md", "apis.json") or checkpoint_re.match(name):
             try:
                 os.remove(os.path.join(OUTDIR, name))
             except Exception as e:
@@ -332,6 +338,45 @@ def target_url_with_scheme(raw):
         default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
         return (f"{scheme}://{host}" if default_port else f"{scheme}://{host}:{port}"), host, port
     return "", raw.strip("[]"), None
+
+def format_base_url(host, port, scheme):
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    return f"{scheme}://{host}" if default_port else f"{scheme}://{host}:{port}"
+
+def scheme_candidates_for_port(port):
+    guessed = "https" if port in HTTPS_PORTS else "http"
+    other = "http" if guessed == "https" else "https"
+    return [guessed, other]
+
+def reachable_base_url(host, port, preferred_url=None):
+    def quick_http_ok(base):
+        try:
+            req = Request(base, headers={"User-Agent":"Mozilla/5.0","Accept":"text/html,application/json"})
+            resp = urlopen(req, timeout=min(2, HTTP_TIMEOUT), context=ssl_ctx)
+            resp.read(1)
+            return True
+        except HTTPError:
+            return True
+        except Exception as e:
+            log.debug(f"Scheme probe {base} failed: {e}")
+            return False
+    if not tcp_check(host, port):
+        return None
+    if preferred_url:
+        if quick_http_ok(preferred_url):
+            return preferred_url.rstrip("/")
+        parsed = urlparse(preferred_url)
+        other_scheme = "http" if parsed.scheme == "https" else "https"
+        other = format_base_url(host, port, other_scheme)
+        if quick_http_ok(other):
+            return other
+        return preferred_url.rstrip("/")
+    for scheme in scheme_candidates_for_port(port):
+        base = format_base_url(host, port, scheme)
+        if quick_http_ok(base):
+            return base
+    guessed = "https" if port in HTTPS_PORTS else "http"
+    return format_base_url(host, port, guessed)
 
 def is_file_endpoint(path):
     parts = re.split(r'[^A-Za-z0-9]+', path.split("?", 1)[0])
@@ -780,6 +825,26 @@ def body_probe_bypass_tests(profile, path):
         tests.append(("POST_FORM_no_auth","POST","application/x-www-form-urlencoded",lambda p: urlencode(p).encode(),{}))
     return tests
 
+def unique_apis(items):
+    seen, out = set(), []
+    for api in items:
+        clean = api.split("?")[0].rstrip("/")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(api)
+    return out
+
+def business_layer_apis(t):
+    apis = [api for api in t["apis"][:80] if not is_file_endpoint(api)]
+    bound = [api for api in t["apis"] if has_body_bound_params(t.get("param_profile"), api)]
+    return unique_apis(apis + bound)
+
+def file_layer_apis(t):
+    apis = [api for api in t["apis"][:80] if is_file_endpoint(api)]
+    bound_files = [api for api in t["apis"] if is_file_endpoint(api) and (has_body_bound_params(t.get("param_profile"), api) or should_param_probe(api, t.get("param_profile")))]
+    return unique_apis(apis + bound_files)
+
 def extract_apis(js_content):
     apis = set()
     for m in LINKFINDER_RE.finditer(js_content):
@@ -1067,18 +1132,23 @@ def text_has_auth_failure(text):
     return any(str(p).lower() in lowered for p in AUTH_FAIL_MSGS)
 
 def is_auth_failure_json(parsed):
-    if not isinstance(parsed, dict):
+    if not isinstance(parsed, (dict, list)):
         return False
-    for key in ("msg", "message", "error", "errorMsg", "errorMessage", "detail", "reason"):
-        if key in parsed and text_has_auth_failure(parsed.get(key)):
-            return True
-    for parent_key in ("data", "result", "payload"):
-        parent = parsed.get(parent_key)
-        if isinstance(parent, dict):
-            for key in ("msg", "message", "error", "errorMsg", "errorMessage", "detail", "reason"):
-                if key in parent and text_has_auth_failure(parent.get(key)):
+    def walk(obj, depth=0):
+        if depth > 4:
+            return False
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in ("msg", "message", "error", "errorMsg", "errorMessage", "detail", "reason") and text_has_auth_failure(value):
                     return True
-    return False
+                if isinstance(value, (dict, list)) and walk(value, depth + 1):
+                    return True
+        elif isinstance(obj, list):
+            for item in obj[:10]:
+                if isinstance(item, (dict, list)) and walk(item, depth + 1):
+                    return True
+        return False
+    return walk(parsed)
 
 # ===== API 测试（双模式） =====
 def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=None, allow_param_probe=True):
@@ -1341,14 +1411,16 @@ def main():
     def probe(t_url):
         normalized, host, port = target_url_with_scheme(t_url)
         if normalized and host and port:
-            if tcp_check(host, port):
-                return normalized
+            base = reachable_base_url(host, port, normalized)
+            return [base] if base else []
         elif host:
+            bases = []
             for port in WEB_PORTS:
-                if tcp_check(host, port):
-                    s = "https" if port in HTTPS_PORTS else "http"
-                    return f"{s}://{host}" if port in (80,443) else f"{s}://{host}:{port}"
-        return None
+                base = reachable_base_url(host, port)
+                if base:
+                    bases.append(base)
+            return bases
+        return []
     with ThreadPoolExecutor(max_workers=WORKERS*4) as pool:
         futures = {pool.submit(probe, t[0]): t for t in targets}
         for f in as_completed(futures):
@@ -1356,7 +1428,9 @@ def main():
             if done % 50 == 0: print(f"  [{done}/{len(targets)}] {len(live)} live")
             try:
                 r = f.result()
-                if r: live.append(r)
+                for item in r or []:
+                    if item and item not in live:
+                        live.append(item)
             except Exception as e:
                 log.debug(f"Probe failed: {e}")
     print(f"  存活: {len(live)}")
@@ -1528,7 +1602,7 @@ def main():
 
     body_fast_tasks, seen_body_fast = [], set()
     for t in api_results:
-        for api in t["apis"][:80]:
+        for api in t["apis"]:
             clean_api = api.split("?")[0].rstrip("/")
             if not clean_api or (t["base"], clean_api) in seen_body_fast:
                 continue
@@ -1599,8 +1673,8 @@ def main():
 
         layers = [
             ("baseline", lambda t: BASELINE_PATHS),
-            ("business", lambda t: [api for api in t["apis"][:80] if not is_file_endpoint(api)]),
-            ("file", lambda t: [api for api in t["apis"][:80] if is_file_endpoint(api)] if not args.disable_file_hunter else []),
+            ("business", business_layer_apis),
+            ("file", file_layer_apis if not args.disable_file_hunter else lambda t: []),
         ]
         print("  3b: 分层 deep test (baseline -> business -> file)")
         for layer_name, api_provider in layers:
@@ -1693,7 +1767,9 @@ def main():
     bypass_counts = {}
     for v in vulnerable:
         for fi in v.get('findings',[]):
-            t = fi.get('test','?'); bypass_counts[t] = bypass_counts.get(t,0)+1
+            tests = fi.get('tests') or ([fi.get('test')] if fi.get('test') else ["?"])
+            for t in tests:
+                bypass_counts[t] = bypass_counts.get(t,0)+1
     if bypass_counts:
         md.append("\n## 绕过方法统计\n\n| 方法 | 命中次数 |\n|------|----------|")
         for t, c in sorted(bypass_counts.items(), key=lambda x:-x[1]): md.append(f"| {t} | {c} |")

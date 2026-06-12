@@ -45,6 +45,7 @@ class Handler(BaseHTTPRequestHandler):
             fetch("/api/auth/expired");
             fetch("/api/auth/permission");
             fetch("/api/auth/data-error");
+            fetch("/api/auth/deep-error");
             '''
             return self.send_body(200, js, "application/javascript")
         if parsed.path == "/api/user/list":
@@ -55,6 +56,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"message": "Access Denied", "data": {"phone": "13800000000"}})
         if parsed.path == "/api/auth/data-error":
             return self.send_json({"msg": "success", "data": {"error": "无权限访问", "phone": "13800000001"}})
+        if parsed.path == "/api/auth/deep-error":
+            return self.send_json({"code": 0, "data": {"result": {"error": "无权限访问", "phone": "13800000002"}}})
         return self.send_json({"code": 404}, status=404)
 
     def do_POST(self):
@@ -67,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"message": "Access Denied", "data": {"phone": "13800000000"}})
         if parsed.path == "/api/auth/data-error":
             return self.send_json({"msg": "success", "data": {"error": "无权限访问", "phone": "13800000001"}})
+        if parsed.path == "/api/auth/deep-error":
+            return self.send_json({"code": 0, "data": {"result": {"error": "无权限访问", "phone": "13800000002"}}})
         return self.send_json({"code": 404}, status=404)
 
 
@@ -114,7 +119,7 @@ def main():
             findings = flatten(report)
             user_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/user/list"]
             auth_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/auth/expired"]
-            permission_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path in ("/api/auth/permission", "/api/auth/data-error")]
+            permission_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path in ("/api/auth/permission", "/api/auth/data-error", "/api/auth/deep-error")]
             assert len(user_findings) == 1, f"user/list should aggregate to 1 finding, got {len(user_findings)}"
             assert user_findings[0].get("variant_count", 0) > len(user_findings[0].get("sample_urls", [])), "variant_count should not be capped by sample_urls"
             assert len(user_findings[0].get("tests", [])) >= 2, "aggregated finding should preserve bypass tests"

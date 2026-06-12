@@ -205,7 +205,12 @@ BASELINE_PATHS = [
     "/seeyon/druid/wall.json","/system/admin/user/official/login",
 ]
 SWAGGER_DOC_PATHS = ["/v2/api-docs", "/v3/api-docs", "/openapi.json", "/swagger.json"]
-AUTH_FAIL_MSGS = ["缺少请求授权令牌","token无效","未登录","请登录","Unauthorized","Forbidden"]
+AUTH_FAIL_MSGS = [
+    "缺少请求授权令牌","token无效","未登录","请登录","Unauthorized","Forbidden",
+    "登录已过期","重新登录","请重新登录","无权限访问","没有权限","权限不足",
+    "认证失败","身份认证失败","登录超时","会话过期","session expired",
+    "access denied","permission denied","not authorized","no permission",
+]
 CAPTCHA_RE = re.compile(
     r"captcha|verifycode|verify_code|verificationcode|validcode|validatecode|"
     r"checkcode|check_code|checknum|randcode|vcode|codeimg|login_code|"
@@ -1133,16 +1138,58 @@ def finding_key(fi):
     fi = normalize_finding(fi)
     if fi.get("file_leak"):
         return "FILE|" + file_entity_key(fi)
-    return fi.get("url", "") + fi.get("test", "")
+    return "|".join([
+        normalized_endpoint(fi.get("url", "")),
+        str(fi.get("risk", "")),
+        str(fi.get("code", "")),
+        str(fi.get("data_count", "")),
+        ",".join(sorted(map(str, fi.get("data_keys", []))))[:200],
+        "cred" if fi.get("credential_leak") else "",
+        "intel" if fi.get("attack_path_intel") else "",
+    ])
+
+def merge_finding_details(dst, src):
+    tests = set(dst.get("tests") or ([dst.get("test")] if dst.get("test") else []))
+    if src.get("test"):
+        tests.add(src.get("test"))
+    if tests:
+        dst["tests"] = sorted(tests)
+    methods = set(dst.get("methods") or ([dst.get("method")] if dst.get("method") else []))
+    if src.get("method"):
+        methods.add(src.get("method"))
+    if methods:
+        dst["methods"] = sorted(methods)
+    urls = list(dst.get("sample_urls") or ([dst.get("url")] if dst.get("url") else []))
+    if src.get("url") and src.get("url") not in urls:
+        urls.append(src.get("url"))
+    if urls:
+        dst["sample_urls"] = urls[:8]
+        dst["variant_count"] = max(int(dst.get("variant_count") or len(urls)), len(urls))
+    if int(src.get("data_count") or 0) > int(dst.get("data_count") or 0):
+        dst["data_count"] = src.get("data_count")
+    if src.get("credential_leak"):
+        dst["credential_leak"] = True
+    if src.get("attack_path_intel"):
+        dst["attack_path_intel"] = True
+    dst["risk"] = risk_level(dst)
+    return dst
 
 def merge_findings(existing, new_items):
-    seen = {finding_key(fi) for fi in existing}
+    seen = {finding_key(fi): fi for fi in existing}
     for fi in new_items or []:
         fi = normalize_finding(fi)
         key = finding_key(fi)
-        if key and key not in seen:
-            seen.add(key)
+        if not key:
+            continue
+        if key not in seen:
+            fi.setdefault("tests", [fi.get("test")] if fi.get("test") else [])
+            fi.setdefault("methods", [fi.get("method")] if fi.get("method") else [])
+            fi.setdefault("sample_urls", [fi.get("url")] if fi.get("url") else [])
+            fi.setdefault("variant_count", 1)
+            seen[key] = fi
             existing.append(fi)
+        else:
+            merge_finding_details(seen[key], fi)
     return existing
 
 def useful_findings(findings):
@@ -1168,9 +1215,11 @@ def report_stats(vulnerable):
     data_findings = [fi for fi in all_findings if fi.get("data_count") or fi.get("data_keys")]
     file_findings = [fi for fi in all_findings if fi.get("file_leak")]
     public_downloads = [fi for fi in file_findings if fi.get("public_download_intel")]
+    merged_variants = sum(max(0, int(fi.get("variant_count") or 1) - 1) for fi in all_findings)
     return {
         "raw_findings": len(all_findings),
         "unique_endpoints": len(unique_endpoint_keys),
+        "merged_variants": merged_variants,
         "data_findings": len(data_findings),
         "unique_data_endpoints": len({normalized_endpoint(fi.get("url", "")) for fi in data_findings}),
         "file_leaks": len(file_findings),
@@ -1611,6 +1660,8 @@ def main():
                 md.append(f"- `{fi.get('method','')}` [{fi.get('risk','?')}] {fi.get('url','')}")
                 if fi.get('data_count'): md.append(f"  - 数据量: {fi['data_count']}")
                 if fi.get('data_keys'): md.append(f"  - 字段: {', '.join(fi['data_keys'][:8])}")
+                if fi.get('variant_count', 1) > 1: md.append(f"  - 聚合命中: {fi.get('variant_count')} 个变体")
+                if fi.get('tests'): md.append(f"  - 绕过方法: {', '.join(fi.get('tests', [])[:8])}")
                 if fi.get('credential_leak'): md.append(f"  - ⚠️ 凭证泄露")
                 if fi.get('file_leak'):
                     label = "公开下载情报" if fi.get("public_download_intel") else "文件泄露"

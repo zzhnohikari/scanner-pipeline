@@ -64,6 +64,7 @@ def main():
         f"- 漏洞目标: {len(vulnerable)}",
         f"- 原始发现: {stats['raw_findings']}",
         f"- 去重端点: {stats['unique_endpoints']}",
+        f"- 聚合变体: {stats.get('merged_variants', 0)}",
         f"- 数据类发现: {stats['data_findings']} / 去重数据端点: {stats['unique_data_endpoints']}",
         f"- 高价值发现: {stats['high_value_findings']}",
         f"- 文件类发现: {stats['file_leaks']} / 公开下载情报: {stats['public_download_intel']}",

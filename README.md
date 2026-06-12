@@ -1,6 +1,6 @@
-# Scanner Pipeline v10
+# Scanner Pipeline v12
 
-JS/API 未授权访问扫描器 — v9 文件专项 + HTML/JS 静态参数画像与种子池
+JS/API 未授权访问扫描器 — 文件专项 + HTML/JS 静态参数画像 + URL/参数绑定组合 fuzz
 
 > **定位**: CTF/攻防赛场景。脚本完成机械工作（JS 提取、API 发现、批量未授权测试），产出报告后由 AI（Claude/GPT）基于结果做精判：选高价值目标、构造正确参数、判断真伪、决定深挖方向。AI 层不在代码内，在操作流程中。
 
@@ -72,6 +72,8 @@ cat results/report.md     # Markdown 报告 (含风险分级)
 
 # 7. 运行本地复杂靶场回归测试
 python3 tests/v10_realistic_lab.py
+python3 tests/v11_param_bind_lab.py
+python3 tests/v12_request_style_lab.py
 ```
 
 ## CLI 参数
@@ -79,7 +81,7 @@ python3 tests/v10_realistic_lab.py
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--input` | `/tmp/v7_targets.json` | 目标 JSON 文件 |
-| `--outdir` | `/tmp/v10_scan_results` | 输出目录 |
+| `--outdir` | `/tmp/v12_scan_results` | 输出目录 |
 | `--workers` | 50 | 并发线程数 |
 | `--timeout` | 12 | HTTP 超时(秒) |
 | `--phase2-timeout` | 180 | Phase 2 软超时, 超时目标用 baseline 兜底 |
@@ -92,6 +94,7 @@ python3 tests/v10_realistic_lab.py
 | `--debug` | false | 调试日志 |
 | `--no-proxy` | false | 绕过 macOS/环境系统代理 |
 | `--fresh` | false | 扫描前清理输出目录中的旧 JSON/Markdown 结果 |
+| `--resume` | false | 报告阶段合并输出目录中的历史 checkpoint，默认只统计本轮结果 |
 | `--disable-file-hunter` | false | 关闭下载/预览/导出接口专项 |
 | `--enable-file-baseline` | false | 启用硬编码文件下载 baseline 路径, 大批资产默认不建议开启 |
 | `--file-max-probes` | 36 | 每个疑似文件接口最多文件参数探测次数 |
@@ -112,11 +115,32 @@ python3 tests/v10_realistic_lab.py
 
 > **注意**: 默认模式 (`--full-bypass` 未开启) 下第一个绕过方法命中后立即短路，不测试后续方法。开启 `--full-bypass` 后将收集所有绕过方法的命中结果。
 
-普通 API 端点自动尝试 3 种查询后缀: 无参数 / `?page=1&count=10` / `?page=1&size=10`。JS/Swagger/页面里真实出现的疑似文件接口会启用文件专项参数模板。v10 还会把 HTML/JS 中提取到的参数名和种子值合并到接口探测中。
+普通 API 端点自动尝试 3 种查询后缀: 无参数 / `?page=1&count=10` / `?page=1&size=10`。JS/Swagger/页面里真实出现的疑似文件接口会启用文件专项参数模板。v12 还会把 HTML/JS 中提取到的 URL 与参数名绑定，在候选目标的 3b 阶段生成组合参数探测。
 
 > **比赛建议**: 大批资产默认不要开启 `--enable-file-baseline`。文件下载/导出类漏洞优先走 JS 提取到的真实端点 + 静态参数画像，这样请求量更小、噪声更低。只有在小批目标二次追打时，再打开硬编码文件 baseline。
 
-## v10 新增: HTML/JS 静态参数画像
+## v12 新增: URL/参数绑定与请求风格解析
+
+v12 会从真实前端请求风格中提取 URL 与参数绑定关系，例如:
+
+- `axios({ url, data })`
+- `axios.get/post`
+- `request({ url, data })`
+- `request("/api/x", { params })`
+- `fetch + JSON.stringify`
+- `fetch + qs.stringify`
+- `fetch + URLSearchParams`
+- `jQuery ajax/get/post/getJSON`
+- `Angular this.http.get/post`
+- `uni.request`
+- `wx.request`
+- `FormData.append + axios.post`
+
+绑定后不会把所有全局参数乱塞到所有接口，而是优先对当前 URL 使用它自己的绑定参数，例如 `/api/user/list` 绑定 `pageNum/pageSize/orgId/keyword` 后生成 `?keyword=test&orgId=1&pageNum=1&pageSize=10`。
+
+参数 fuzz 默认只在候选目标的 3b 深测阶段开启，3a 快筛不做静态参数组合，避免大批量目标请求膨胀。
+
+## HTML/JS 静态参数画像
 
 用于补足“没有 Swagger 的站点也能做参数提取和探测”的缺口。爬取首页、内联脚本、业务 JS、同站二级页面时同步提取:
 
@@ -138,9 +162,9 @@ python3 tests/v10_realistic_lab.py
 
 `--dry-run` 的 `apis.json` 会输出 `param_names`、`seed_values`、`file_seed_values` 供人工复核。
 
-## v9 新增: 未授权文件接口专项
+## 未授权文件接口专项
 
-重点探测下载、预览、导出、附件、模板、图片等接口。v10 默认只对 JS/Swagger/页面中发现的真实文件端点启用专项探测，不再对所有目标暴力枚举硬编码文件下载路径:
+重点探测下载、预览、导出、附件、模板、图片等接口。v12 默认只对 JS/Swagger/页面中发现的真实文件端点启用专项探测，不再对所有目标暴力枚举硬编码文件下载路径:
 
 ```text
 download, file, export, preview, view, read, attachment, attach,
@@ -216,14 +240,14 @@ name, fileName, key, objectKey, ossKey, resourceId
 ## 已知限制
 
 1. **SSL 超时**: 极慢的 SSL 握手(>30s)仍可能被跳过
-2. **参数构造**: v10 会从 HTML/JS 提取参数名和种子, 但仍不是完整语义级请求重放
+2. **参数构造**: v12 会从 HTML/JS 提取参数名、种子和 URL/参数绑定关系, 但仍不是完整语义级请求重放
 3. **非 JSON 响应**: XML/SOAP/HTML 中的数据可能被跳过
 4. **纯 API 服务器**: 无 JS 可提取, 仅测基准路径
 5. **文件专项误差**: 无真实文件 ID/对象 Key 时仍可能漏报; 业务错误若返回附件头或文件类型可能需要人工复核
 6. **报告不含截图**: 证据采集需手动用 Chrome MCP 完成
 7. **broad 模式请求量**: `--param-probe-mode broad` 会显著增加请求量, 大批资产默认不建议开启
 8. **硬编码文件 baseline**: `--enable-file-baseline` 会显著增加请求量和 WAF 噪声, 只适合小批目标二次验证
-9. **输出目录复用**: 默认会合并 checkpoint 结果; 重新跑完整扫描建议加 `--fresh`
+9. **输出目录复用**: 默认报告只统计本轮结果; 需要合并历史 checkpoint 时显式加 `--resume`; 重新跑完整扫描建议加 `--fresh`
 
 ## 本地复杂靶场
 
@@ -241,6 +265,10 @@ name, fileName, key, objectKey, ossKey, resourceId
 - `/api/profile` 不产生 `file_leak`
 - `verifyCode` PNG 不产生 `file_leak`
 - 默认模式不会请求 `/api/common/download` 等硬编码文件 baseline
+
+`tests/v11_param_bind_lab.py` 覆盖 webpack、jQuery ajax、axios 三类 URL/参数绑定场景。
+
+`tests/v12_request_style_lab.py` 覆盖 axios object、request params、uni/wx request、qs.stringify、URLSearchParams、Angular HttpClient、jQuery getJSON、FormData 等更多实战请求风格。
 
 ## 比赛算分标准
 

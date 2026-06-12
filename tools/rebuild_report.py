@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild v10 report.json/report.md from checkpoint JSON files in an outdir."""
+"""Rebuild v12 report.json/report.md from checkpoint JSON files in an outdir."""
 
 import argparse
 import importlib.util
@@ -8,14 +8,21 @@ from pathlib import Path
 
 
 def load_scanner(root):
-    spec = importlib.util.spec_from_file_location("deep_scanner_rebuild", root / "deep_scanner.py")
+    candidates = [
+        root / "deep_scanner.py",
+        root / "scripts" / "pipeline" / "deep_scanner.py",
+    ]
+    scanner_path = next((path for path in candidates if path.exists()), None)
+    if not scanner_path:
+        raise FileNotFoundError("deep_scanner.py not found in project root or scripts/pipeline")
+    spec = importlib.util.spec_from_file_location("deep_scanner_rebuild", scanner_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Rebuild v10 reports from checkpoint JSON files")
+    parser = argparse.ArgumentParser(description="Rebuild v12 reports from checkpoint JSON files")
     parser.add_argument("--outdir", required=True)
     args, scanner_args = parser.parse_known_args()
 
@@ -52,7 +59,7 @@ def main():
     (outdir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     md = [
-        "# 扫描报告 v10 (rebuilt)\n",
+        "# 扫描报告 v12 (rebuilt)\n",
         "## 统计口径\n",
         f"- 漏洞目标: {len(vulnerable)}",
         f"- 原始发现: {stats['raw_findings']}",

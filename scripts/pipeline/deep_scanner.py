@@ -96,6 +96,7 @@ QUERY_PARAM_RE = re.compile(r'''[?&]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})=''')
 OBJECT_PARAM_RE = re.compile(r'''["']?([a-zA-Z_][a-zA-Z0-9_]{1,40})["']?\s*:\s*["']?([a-zA-Z0-9_\-./:@]{1,120})["']?''')
 FORM_FIELD_RE = re.compile(r'''(?:name|v-model|prop|field)\s*=\s*["']([a-zA-Z_][a-zA-Z0-9_.\-\[\]]{1,60})["']''', re.I)
 REQUEST_BODY_RE = re.compile(r'''(?:params|data|body)\s*:\s*\{([^{}]{1,2000})\}''', re.I)
+NESTED_OBJECT_RE = re.compile(r'''["']?([a-zA-Z_][a-zA-Z0-9_]{1,40})["']?\s*:\s*(\{[^{}]{1,1200}\})''')
 
 def _param_source_from_prop(prop, method=""):
     prop = (prop or "").lower()
@@ -443,7 +444,7 @@ def file_query_suffixes(path):
     return suffixes + probes
 
 def empty_param_profile():
-    return {"names": set(), "seeds": set(), "file_seeds": set(), "api_params": {}, "api_param_sources": {}}
+    return {"names": set(), "seeds": set(), "file_seeds": set(), "api_params": {}, "api_param_sources": {}, "api_param_shapes": {}}
 
 def normalize_param_name(name):
     name = (name or "").strip().strip("[]")
@@ -464,6 +465,20 @@ def add_param_name(profile, name, api_path=None, source="query"):
             profile["api_params"].setdefault(api_path, set()).add(name)
             source = source if source in ("query", "json", "form") else "query"
             profile.setdefault("api_param_sources", {}).setdefault(api_path, {}).setdefault(source, set()).add(name)
+
+def add_param_shape(profile, api_path, source, parent, names):
+    if not api_path or source not in ("json", "form"):
+        return
+    parent = normalize_param_name(parent)
+    clean_names = [normalize_param_name(n) for n in names]
+    clean_names = [n for n in clean_names if n]
+    if not parent or not clean_names:
+        return
+    api_path = api_path.split("?")[0].split("#")[0].rstrip("/")
+    if not api_path:
+        return
+    shapes = profile.setdefault("api_param_shapes", {}).setdefault(api_path, {}).setdefault(source, {})
+    shapes.setdefault(parent, set()).update(clean_names)
 
 def add_seed(profile, value, file_hint=False):
     value = str(value or "").strip().strip('"\'')
@@ -495,6 +510,12 @@ def merge_param_profiles(dst, src):
         dst_sources = dst.setdefault("api_param_sources", {}).setdefault(path, {})
         for source, names in sources.items():
             dst_sources.setdefault(source, set()).update(names)
+    for path, sources in src.get("api_param_shapes", {}).items():
+        dst_shapes = dst.setdefault("api_param_shapes", {}).setdefault(path, {})
+        for source, parents in sources.items():
+            dst_source_shapes = dst_shapes.setdefault(source, {})
+            for parent, names in parents.items():
+                dst_source_shapes.setdefault(parent, set()).update(names)
     for api in src.get("_apis_from_params", set()):
         dst.setdefault("_apis_from_params", set()).add(api)
     return dst
@@ -522,6 +543,13 @@ def extract_param_profile(content):
             for key, value in OBJECT_PARAM_RE.findall(body_text):
                 add_param_name(profile, key, api_path=url_path, source=source)
                 add_seed(profile, value)
+            for parent, nested in NESTED_OBJECT_RE.findall(body_text):
+                child_names = []
+                for key, value in OBJECT_PARAM_RE.findall(nested):
+                    child_names.append(key)
+                    add_param_name(profile, key, api_path=url_path, source=source)
+                    add_seed(profile, value)
+                add_param_shape(profile, url_path, source, parent, child_names)
     # 全局 body 提取 (无URL上下文)
     for m in REQUEST_BODY_RE.finditer(sample):
         for key, value in OBJECT_PARAM_RE.findall(m.group(1)):
@@ -567,6 +595,14 @@ def bound_param_names_by_source(profile, path, source):
             if name not in names:
                 names.append(name)
     return names
+
+def bound_param_shapes_by_source(profile, path, source):
+    merged = {}
+    for candidate in path_param_candidates(path):
+        sources = profile.get("api_param_shapes", {}).get(candidate, {})
+        for parent, names in sources.get(source, {}).items():
+            merged.setdefault(parent, set()).update(names)
+    return merged
 
 def prioritized_param_names(profile, path):
     names = bound_param_names(profile, path)
@@ -642,6 +678,21 @@ def build_param_payload(names, seeds, max_names=6):
         payload[name] = param_seed_value(name, seeds)
     return payload
 
+def build_nested_payload(shapes, seeds, max_parents=4, max_children=6):
+    payload = {}
+    used = 0
+    for parent in sorted(shapes):
+        children = sorted(shapes[parent])
+        if not children:
+            continue
+        payload[parent] = {}
+        for child in children[:max_children]:
+            payload[parent][child] = param_seed_value(child, seeds)
+        used += 1
+        if used >= max_parents:
+            break
+    return payload
+
 def param_query_suffixes(path, profile):
     if not should_param_probe(path, profile):
         return []
@@ -687,6 +738,10 @@ def body_param_payloads(path, profile, body_type, allow_param_probe=True):
     if not names:
         return []
     payloads = []
+    shapes = bound_param_shapes_by_source(profile, path, body_type)
+    nested = build_nested_payload(shapes, seeds)
+    if nested:
+        payloads.append(nested)
     combo = build_param_payload(names, seeds)
     if combo:
         payloads.append(combo)
@@ -706,6 +761,19 @@ def request_variants(path, method, content_type, body_func, param_profile=None, 
                 variants.append(item)
         return variants
     return [(qs, None) for qs in query_suffixes(path, param_profile, allow_param_probe=allow_param_probe)]
+
+def has_body_bound_params(profile, path):
+    if not profile:
+        return False
+    return bool(bound_param_names_by_source(profile, path, "json") or bound_param_names_by_source(profile, path, "form"))
+
+def body_probe_bypass_tests(profile, path):
+    tests = []
+    if bound_param_names_by_source(profile, path, "json"):
+        tests.append(("POST_JSON_no_auth","POST","application/json",lambda p: json.dumps(p).encode(),{}))
+    if bound_param_names_by_source(profile, path, "form"):
+        tests.append(("POST_FORM_no_auth","POST","application/x-www-form-urlencoded",lambda p: urlencode(p).encode(),{}))
+    return tests
 
 def extract_apis(js_content):
     apis = set()
@@ -952,13 +1020,29 @@ def check_response(body, url, method, test_name, status_code=None):
         if code in ("10031","401","403","500002","40001"): return None
         if any(p in msg for p in AUTH_FAIL_MSGS): return None
         d = parsed.get("data")
-        has_data = (isinstance(d, list) and len(d)>0) or (isinstance(d, dict) and d and set(d.keys())-{"path","time","timestamp","error","status"}) or bool(parsed.get("records")) or bool(parsed.get("list")) or bool(parsed.get("items"))
+        data_source = d
+        if not data_source:
+            for key in ("records", "list", "items", "rows"):
+                if parsed.get(key):
+                    data_source = parsed.get(key)
+                    break
+        if not data_source:
+            for parent_key in ("result", "page", "payload"):
+                parent = parsed.get(parent_key)
+                if isinstance(parent, dict):
+                    for child_key in ("records", "list", "items", "rows", "data"):
+                        if parent.get(child_key):
+                            data_source = parent.get(child_key)
+                            break
+                if data_source:
+                    break
+        has_data = (isinstance(data_source, list) and len(data_source)>0) or (isinstance(data_source, dict) and data_source and set(data_source.keys())-{"path","time","timestamp","error","status"})
         if has_data or code in ("0","200","20000") or attack_path_ok:
             f = {"url":url,"method":method,"test":test_name,"code":code,"msg":msg[:200]}
-            if isinstance(d, list):
-                f["data_count"]=len(d)
-                if d and isinstance(d[0], dict): f["data_keys"] = list(d[0].keys())[:15]
-            elif isinstance(d, dict): f["data_keys"]=list(d.keys())[:15]
+            if isinstance(data_source, list):
+                f["data_count"]=len(data_source)
+                if data_source and isinstance(data_source[0], dict): f["data_keys"] = list(data_source[0].keys())[:15]
+            elif isinstance(data_source, dict): f["data_keys"]=list(data_source.keys())[:15]
             if "secret" in body.lower() or "password" in body.lower(): f["credential_leak"]=True
             f["risk"] = risk_level(f)
             f["raw"] = body[:500]
@@ -1222,7 +1306,7 @@ def main():
         param_profile = empty_param_profile()
         status, final_url, html, ct = http_get(page_url, retries=0)
         swagger_apis = collect_swagger_apis(base)
-        if not status or not html or len(html) < 50:
+        if not status or not html:
             apis = set(BASELINE_PATHS) | swagger_apis
             apis = expand_with_prefixes(apis, path_prefixes)
             return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"sensitive":[],"js_count":0,"param_profile":param_profile}
@@ -1373,6 +1457,32 @@ def main():
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     print(f"  3a/fast 耗时: {time.time()-t_start:.0f}s")
+
+    body_fast_tasks, seen_body_fast = [], set()
+    for t in api_results:
+        for api in t["apis"][:80]:
+            clean_api = api.split("?")[0].rstrip("/")
+            if not clean_api or (t["base"], clean_api) in seen_body_fast:
+                continue
+            if not has_body_bound_params(t.get("param_profile"), clean_api):
+                continue
+            if not should_param_probe(clean_api, t.get("param_profile")):
+                continue
+            seen_body_fast.add((t["base"], clean_api))
+            body_fast_tasks.append((t, clean_api))
+    if body_fast_tasks:
+        print(f"  3a/body-fast: {len(body_fast_tasks)} bound POST tasks")
+        t_start = time.time()
+        def test_body_fast(task):
+            t, api = task
+            tests = body_probe_bypass_tests(t.get("param_profile"), api)
+            return t["base"], test_api(t["base"], api, tests, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=True)
+        def handle_body_fast(result):
+            base_url, findings = result
+            if findings:
+                target_map[base_url]["_f"].extend(findings)
+        run_task_pool(body_fast_tasks, WORKERS, args.phase3a_timeout, "3a/body-fast", test_body_fast, handle_body_fast)
+        print(f"  3a/body-fast 耗时: {time.time()-t_start:.0f}s")
 
     candidates = []
     for base, t in target_map.items():

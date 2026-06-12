@@ -19,6 +19,7 @@ parser.add_argument('--timeout', type=int, default=12, help='HTTP超时(秒)')
 parser.add_argument('--phase2-timeout', type=int, default=180, help='Phase 2 JS/API提取软超时(秒),超时目标用baseline兜底')
 parser.add_argument('--phase3a-timeout', type=int, default=240, help='Phase 3a 快筛软超时(秒),超时后先进入候选/补筛流程')
 parser.add_argument('--rescue-timeout', type=int, default=180, help='Phase 3a baseline补筛软超时(秒)')
+parser.add_argument('--disable-rescue-baseline', action='store_true', help='关闭Phase 3a baseline补筛')
 parser.add_argument('--phase3b-layer-timeout', type=int, default=300, help='Phase 3b 每个分层软超时(秒)')
 parser.add_argument('--limit', type=int, default=0, help='限制目标数量,0=全部')
 parser.add_argument('--dry-run', action='store_true', help='只提取API,不测试')
@@ -1375,7 +1376,7 @@ def main():
             t["findings"] = merge_findings(t.get("findings", []), real)
             write_target_result(t)
             candidates.append(t)
-    if args.full_bypass:
+    if not args.disable_rescue_baseline:
         candidate_bases = {t["base"] for t in candidates}
         rescue_tasks = []
         for t in api_results:
@@ -1384,11 +1385,13 @@ def main():
             for api in BASELINE_PATHS:
                 rescue_tasks.append((t, api))
         if rescue_tasks:
-            print(f"  3a/rescue-baseline: {len(rescue_tasks)} FULL tasks for {len(api_results)-len(candidate_bases)} non-candidates")
+            rescue_bypass = FULL_BYPASS if args.full_bypass else FAST_BYPASS
+            rescue_label = "FULL" if args.full_bypass else "FAST"
+            print(f"  3a/rescue-baseline: {len(rescue_tasks)} {rescue_label} tasks for {len(api_results)-len(candidate_bases)} non-candidates")
             t_start = time.time()
             def test_rescue(task):
                 t, api = task
-                return t["base"], test_api(t["base"], api, FULL_BYPASS, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=False)
+                return t["base"], test_api(t["base"], api, rescue_bypass, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=False)
             def handle_rescue(result):
                 base_url, findings = result
                 real = useful_findings(findings)

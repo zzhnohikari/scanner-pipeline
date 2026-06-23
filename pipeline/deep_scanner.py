@@ -4,15 +4,32 @@ v13: 文件专项 + HTML/JS静态参数画像 + URL/参数绑定 + POST body/for
 融合 JSFinder/Webpack_extract/VueCrack/Packer-Fuzzer 技术
 """
 
-import os, re, json, time, ssl, socket, argparse, logging
+import os, re, json, time, ssl, socket, argparse, logging, shutil, shlex, subprocess, tempfile, gzip, zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse, urljoin, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+try:
+    import brotli as _brotli
+except ImportError:
+    try:
+        import brotlicffi as _brotli
+    except ImportError:
+        _brotli = None
+
 def build_parser():
     parser = argparse.ArgumentParser(description='JS/API 未授权访问扫描器 v13')
     parser.add_argument('--input', default='/tmp/v7_targets.json', help='目标JSON文件')
+    parser.add_argument('--input-format', choices=['targets','hostport','masscan','httpx-json'], default='targets', help='输入格式: targets(JSON) / hostport / masscan / httpx-json')
+    parser.add_argument('--port-scanner', choices=['none','masscan','naabu','auto'], default='none', help='可选外部端口发现器,用于大批IP/CIDR: none/masscan/naabu/auto')
+    parser.add_argument('--http-prober', choices=['internal','httpx','auto'], default='internal', help='HTTP确认层: internal使用内置Phase1,httpx调用外部httpx,auto优先httpx')
+    parser.add_argument('--scan-ports', default='80,443,8080,8443,8001,81,82,88,3000,4000,5000,7000,8000,8002,8003,8008,8081,8088,8089,8888,9000,9090,9443,10000,10080,10443,4433,4443', help='外部端口发现器使用的端口列表')
+    parser.add_argument('--scan-rate', type=int, default=1000, help='masscan/naabu端口发现速率')
+    parser.add_argument('--masscan-bin', default='', help='masscan二进制路径,默认从PATH查找')
+    parser.add_argument('--naabu-bin', default='', help='naabu二进制路径,默认从PATH查找')
+    parser.add_argument('--httpx-bin', default='', help='httpx二进制路径,默认从PATH查找')
+    parser.add_argument('--httpx-extra-args', default='', help='透传给httpx的附加参数,例如 \"-follow-redirects -retries 1\"')
     parser.add_argument('--outdir', default='/tmp/v13_scan_results', help='输出目录')
     parser.add_argument('--workers', type=int, default=50, help='并发数')
     parser.add_argument('--timeout', type=int, default=12, help='HTTP超时(秒)')
@@ -23,9 +40,12 @@ def build_parser():
     parser.add_argument('--phase3b-layer-timeout', type=int, default=300, help='Phase 3b 每个分层软超时(秒)')
     parser.add_argument('--limit', type=int, default=0, help='限制目标数量,0=全部')
     parser.add_argument('--dry-run', action='store_true', help='只提取API,不测试')
-    parser.add_argument('--full-bypass', action='store_true', help='收集所有绕过方法(默认命中断路)')
+    parser.add_argument('--full-bypass', action='store_true', help='启用FULL绕过方法,默认仍命中断路')
+    parser.add_argument('--collect-all-variants', action='store_true', help='命中后继续收集所有绕过/参数变体,隐含--full-bypass,小批目标补证据用')
     parser.add_argument('--debug', action='store_true', help='调试日志')
     parser.add_argument('--no-proxy', action='store_true', help='绕过系统代理(ClashX等)')
+    parser.add_argument('--skip-port-probe', action='store_true', help='跳过TCP connect预检,仍保留HTTP/scheme确认')
+    parser.add_argument('--allow-unverified-url', action='store_true', help='显式URL的HTTP/scheme确认失败时仍保留输入URL')
     parser.add_argument('--fresh', action='store_true', help='扫描前清理输出目录中的旧JSON报告/checkpoint')
     parser.add_argument('--resume', action='store_true', help='报告阶段合并输出目录中的历史checkpoint(默认只统计本轮结果)')
     parser.add_argument('--disable-file-hunter', action='store_true', help='关闭下载/预览/导出接口专项检测')
@@ -34,12 +54,17 @@ def build_parser():
     parser.add_argument('--disable-param-harvest', action='store_true', help='关闭HTML/JS静态参数画像')
     parser.add_argument('--param-max-probes', type=int, default=12, help='每个接口最多静态参数模板探测次数')
     parser.add_argument('--param-probe-mode', choices=['targeted','broad'], default='targeted', help='静态参数探测模式: targeted仅高价值接口,broad全部接口')
+    parser.add_argument('--js-max-download', type=int, default=0, help='每个目标最多下载的外链JS数量，0=全部下载')
+    parser.add_argument('--phase3a-param-rescue', action='store_true', help='3a阶段对有绑定参数的高价值API做小流量参数补筛')
+    parser.add_argument('--phase3a-param-rescue-max-apis', type=int, default=10, help='每个目标最多参与3a参数补筛的API数')
     return parser
 
 def parse_cli(argv=None):
     return build_parser().parse_args(argv)
 
 args = parse_cli() if __name__ == "__main__" else parse_cli([])
+if args.collect_all_variants:
+    args.full_bypass = True
 
 log = logging.getLogger('scanner')
 log.addHandler(logging.StreamHandler())
@@ -47,11 +72,12 @@ log.setLevel(logging.DEBUG if args.debug else logging.WARNING)
 
 TCP_TIMEOUT = 1.5; HTTP_TIMEOUT = args.timeout; API_TIMEOUT = max(6, args.timeout//2)
 WORKERS = args.workers; SSL_RETRIES = 2; OUTDIR = args.outdir
+PHASE2_INVENTORY_NAME = "phase2_inventory.jsonl"
 os.makedirs(OUTDIR, exist_ok=True)
 if args.fresh:
     checkpoint_re = re.compile(r'^(?:https?___|[a-zA-Z0-9_.-]+_\\d+).*\\.json$')
     for name in os.listdir(OUTDIR):
-        if name in ("report.json", "report.md", "apis.json") or checkpoint_re.match(name):
+        if name in ("report.json", "report.md", "apis.json", PHASE2_INVENTORY_NAME) or checkpoint_re.match(name):
             try:
                 os.remove(os.path.join(OUTDIR, name))
             except Exception as e:
@@ -69,6 +95,9 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 
 # 绕过系统代理 (ClashX 等 macOS 系统级代理)
 if args.no_proxy:
+    for _proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        os.environ.pop(_proxy_var, None)
+    os.environ["NO_PROXY"] = "*"
     import urllib.request as _ur
     _proxy_handler = _ur.ProxyHandler({})
     _no_proxy_opener = _ur.build_opener(_proxy_handler)
@@ -91,6 +120,8 @@ COMMON_LIBS = re.compile(r'(?:jquery|bootstrap|vue\.min|vue\.runtime|react\.min|
 VUE_INSTANCE_RE = re.compile(r'''__vue_app__|__vue__|createApp|createRouter|new Vue\(|useRouter|useRoute''')
 VUE_ROUTER_RE = re.compile(r'''(?:path|route)\s*:\s*["']([^"']{1,200})["']''', re.I)
 REACT_ROUTE_RE = re.compile(r'<Route\s+(?:path|to)\s*=\s*["\x27]([^"\x27]{1,200})["\x27]', re.I)
+MODULE_ASSET_RE = re.compile(r'(?:^/@vite/client$|^/@id/|^/src/|^src/|\.(?:js|mjs|ts|tsx|jsx|vue)(?:[?#]|$))', re.I)
+STATIC_ASSET_RE = re.compile(r'\.(?:css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|pdf|doc|docx|xls|xlsx|zip|rar|7z)(?:[?#]|$)', re.I)
 API_PREFIX_RE = re.compile(
     r'''["']?(?:baseURL|baseUrl|baseApi|apiBase|apiPrefix|apiUrl|apiURL|api_url|apiHost|api_host|'''
     r'''contextPath|serverBase|serverUrl|serverURL|proxyPrefix|VUE_APP_BASE_API|'''
@@ -217,6 +248,11 @@ AUTH_FAIL_MSGS = [
     "认证失败","身份认证失败","登录超时","会话过期","session expired",
     "access denied","permission denied","not authorized","no permission",
 ]
+FRAMEWORK_NOT_FOUND_RE = re.compile(
+    r"controller not exists|method not exists|class not exists|module not exists|route not found|"
+    r"not exists:app[\\\\/]controller",
+    re.I,
+)
 CAPTCHA_RE = re.compile(
     r"captcha|verifycode|verify_code|verificationcode|validcode|validatecode|"
     r"checkcode|check_code|checknum|randcode|vcode|codeimg|login_code|"
@@ -273,23 +309,79 @@ def tcp_check(host, port):
         log.debug(f"TCP {host}:{port} failed: {e}")
         return False
 
+def _decompress_deflate(body):
+    try:
+        return zlib.decompress(body)
+    except Exception:
+        return zlib.decompress(body, -zlib.MAX_WBITS)
+
+def _maybe_decompress_http_body(body, headers=None):
+    if not body:
+        return body
+    headers = headers or {}
+    content_encoding = str(headers.get("Content-Encoding", "")).lower()
+    tried = []
+    if "gzip" in content_encoding:
+        tried.append(("gzip", gzip.decompress))
+    if "deflate" in content_encoding:
+        tried.append(("deflate", _decompress_deflate))
+    if "br" in content_encoding and _brotli:
+        tried.append(("br", _brotli.decompress))
+    if body[:2] == b"\x1f\x8b" and not any(name == "gzip" for name, _ in tried):
+        tried.append(("gzip", gzip.decompress))
+    if body[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda") and not any(name == "deflate" for name, _ in tried):
+        tried.append(("deflate", _decompress_deflate))
+    for name, func in tried:
+        try:
+            return func(body)
+        except Exception as e:
+            log.debug(f"HTTP body {name} decompress failed: {e}")
+    return body
+
+def http_accept_encoding():
+    return "gzip, deflate" + (", br" if _brotli else "")
+
+def _text_decode_body(raw_bytes, headers=None):
+    headers = headers or {}
+    content_type = str(headers.get("Content-Type", ""))
+    m = re.search(r'charset=([a-zA-Z0-9._-]+)', content_type, re.I)
+    encodings = []
+    if m:
+        encodings.append(m.group(1))
+    for enc in ("utf-8", "gb18030", "latin-1"):
+        if enc not in encodings:
+            encodings.append(enc)
+    for enc in encodings:
+        try:
+            return raw_bytes.decode(enc)
+        except Exception:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
+
+def decode_http_body(body, headers=None):
+    headers = headers or {}
+    raw = _maybe_decompress_http_body(body, headers)
+    return _text_decode_body(raw, headers)
+
+def read_http_response(resp, max_size=1_000_000):
+    raw = read_limited(resp, max_size=max_size)
+    body_bytes = _maybe_decompress_http_body(raw, resp.headers)
+    text = _text_decode_body(body_bytes, resp.headers)
+    return raw, body_bytes, text
+
 def http_get(url, timeout=HTTP_TIMEOUT, max_size=1_000_000, retries=SSL_RETRIES):
     for attempt in range(retries + 1):
         try:
-            req = Request(url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept":"text/html,application/javascript,application/json,*/*"})
+            req = Request(url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept":"text/html,application/javascript,application/json,*/*","Accept-Encoding":http_accept_encoding()})
             resp = urlopen(req, timeout=timeout * (attempt + 1), context=ssl_ctx)
-            body = b""
-            while True:
-                try:
-                    chunk = resp.read(65536)
-                    if not chunk: break
-                    body += chunk
-                    if len(body) > max_size: break
-                except: break
-            return resp.getcode(), resp.url, body.decode('utf-8', errors='replace'), resp.headers.get("Content-Type","")
+            _, _, text = read_http_response(resp, max_size=max_size)
+            return resp.getcode(), resp.url, text, resp.headers.get("Content-Type","")
         except HTTPError as e:
-            try: return e.code, e.url, e.read().decode('utf-8', errors='replace')[:100000], ""
-            except: return e.code, e.url, "", ""
+            try:
+                err_body = read_limited(e, max_size=max_size)
+                return e.code, e.url, decode_http_body(err_body, e.headers)[:100000], e.headers.get("Content-Type","")
+            except:
+                return e.code, e.url, "", ""
         except Exception as e:
             if 'SSL' in str(e) or 'handshake' in str(e).lower() or 'timed out' in str(e).lower():
                 if attempt < retries:
@@ -317,6 +409,220 @@ def compact_url(url, max_len=120):
     keep_head = max_len // 2
     keep_tail = max_len - keep_head - 3
     return url[:keep_head] + "..." + url[-keep_tail:]
+
+def input_item(url, title="", score=0):
+    url = str(url or "").strip()
+    if not url:
+        return None
+    return (url, str(title or ""), score or 0)
+
+def dedupe_targets(items):
+    seen, out = set(), []
+    for item in items or []:
+        if not item:
+            continue
+        key = item[0]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+def parse_masscan_item(obj):
+    if not isinstance(obj, dict):
+        return []
+    host = obj.get("ip") or obj.get("host") or obj.get("addr")
+    ports = obj.get("ports") or []
+    out = []
+    if host and isinstance(ports, list):
+        for port_obj in ports:
+            if not isinstance(port_obj, dict):
+                continue
+            port = port_obj.get("port")
+            proto = str(port_obj.get("proto") or port_obj.get("protocol") or "tcp").lower()
+            if port and proto == "tcp":
+                item = input_item(f"{host}:{port}", "masscan", 0)
+                if item:
+                    out.append(item)
+    port = obj.get("port")
+    if host and port:
+        item = input_item(f"{host}:{port}", "masscan", 0)
+        if item:
+            out.append(item)
+    return out
+
+def resolve_tool(name, override=""):
+    if override:
+        if os.path.exists(override) or shutil.which(override):
+            return override
+        return ""
+    candidates = [name]
+    if os.name == "nt" and not name.lower().endswith(".exe"):
+        candidates.append(name + ".exe")
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return ""
+
+def require_tool(name, override=""):
+    path = resolve_tool(name, override)
+    if not path:
+        raise RuntimeError(f"Missing external tool: {name}. Install it or pass --{name}-bin /path/to/{name}.")
+    return path
+
+def command_env():
+    env = os.environ.copy()
+    if args.no_proxy:
+        for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(proxy_var, None)
+        env["NO_PROXY"] = "*"
+    return env
+
+def run_command(cmd, label):
+    if args.debug:
+        print(f"  {label}: {' '.join(shlex.quote(str(c)) for c in cmd)}")
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=command_env())
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"{label} failed with exit {proc.returncode}: {detail[:1000]}")
+    if args.debug and proc.stderr.strip():
+        log.debug(proc.stderr.strip()[:2000])
+    return proc.stdout
+
+def write_target_lines(path, targets):
+    with open(path, "w", encoding="utf-8") as f:
+        for target, _, _ in targets:
+            if target:
+                f.write(str(target).strip() + "\n")
+
+def run_port_discovery(targets):
+    if args.port_scanner == "none":
+        return targets
+    scanner = args.port_scanner
+    if scanner == "auto":
+        if resolve_tool("masscan", args.masscan_bin):
+            scanner = "masscan"
+        elif resolve_tool("naabu", args.naabu_bin):
+            scanner = "naabu"
+        else:
+            raise RuntimeError("No port scanner found in PATH. Install masscan/naabu or use --port-scanner none.")
+    print(f"\n[Preflight] 端口发现: {scanner} ports={args.scan_ports} rate={args.scan_rate}")
+    with tempfile.TemporaryDirectory(prefix="scanner_ports_") as tmp:
+        in_path = os.path.join(tmp, "targets.txt")
+        out_path = os.path.join(tmp, "ports.out")
+        write_target_lines(in_path, targets)
+        if scanner == "masscan":
+            bin_path = require_tool("masscan", args.masscan_bin)
+            cmd = [bin_path, "-iL", in_path, "-p", args.scan_ports, "--rate", str(args.scan_rate), "-oL", out_path]
+            run_command(cmd, "masscan")
+            discovered = load_targets(out_path, "masscan")
+        elif scanner == "naabu":
+            bin_path = require_tool("naabu", args.naabu_bin)
+            cmd = [bin_path, "-list", in_path, "-p", args.scan_ports, "-rate", str(args.scan_rate), "-silent", "-o", out_path]
+            run_command(cmd, "naabu")
+            discovered = load_targets(out_path, "hostport")
+        else:
+            discovered = targets
+    discovered = dedupe_targets(discovered)
+    print(f"  端口发现结果: {len(discovered)} host:port")
+    return discovered
+
+def run_httpx_probe(targets):
+    prober = args.http_prober
+    if prober == "internal":
+        return None
+    bin_path = resolve_tool("httpx", args.httpx_bin)
+    if prober == "auto" and not bin_path:
+        print("\n[Preflight] HTTP探测: httpx not found, fallback to internal Phase 1")
+        return None
+    if not bin_path:
+        raise RuntimeError("Missing external tool: httpx. Install ProjectDiscovery httpx or use --http-prober internal.")
+    print(f"\n[Preflight] HTTP探测: httpx")
+    with tempfile.TemporaryDirectory(prefix="scanner_httpx_") as tmp:
+        in_path = os.path.join(tmp, "hostports.txt")
+        out_path = os.path.join(tmp, "httpx.jsonl")
+        write_target_lines(in_path, targets)
+        cmd = [
+            bin_path, "-l", in_path, "-json", "-silent", "-no-color",
+            "-title", "-status-code", "-location", "-follow-host-redirects",
+            "-timeout", str(max(1, HTTP_TIMEOUT)), "-o", out_path,
+        ]
+        if args.httpx_extra_args:
+            cmd.extend(shlex.split(args.httpx_extra_args))
+        run_command(cmd, "httpx")
+        discovered = load_targets(out_path, "httpx-json")
+    discovered = dedupe_targets(discovered)
+    print(f"  HTTP探测结果: {len(discovered)} live URLs")
+    return [item[0] for item in discovered]
+
+def load_targets(path, input_format):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    targets = []
+    if input_format == "targets":
+        data = json.loads(raw)
+        for t in data:
+            if isinstance(t, str):
+                item = input_item(t)
+            else:
+                item = input_item(t.get("url"), t.get("title", ""), t.get("score", 0))
+            if item:
+                targets.append(item)
+    elif input_format == "hostport":
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            item = input_item(parts[0], "hostport", 0)
+            if item:
+                targets.append(item)
+    elif input_format == "masscan":
+        stripped = raw.strip()
+        if stripped.startswith("["):
+            for obj in json.loads(stripped):
+                targets.extend(parse_masscan_item(obj))
+        elif stripped.startswith("{"):
+            for line in raw.splitlines():
+                line = line.strip().rstrip(",")
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    targets.extend(parse_masscan_item(json.loads(line)))
+                except Exception:
+                    continue
+        else:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                item = None
+                if len(parts) >= 4 and parts[0].lower() == "open" and parts[1].lower() == "tcp" and parts[2].isdigit():
+                    item = input_item(f"{parts[3]}:{parts[2]}", "masscan", 0)
+                elif len(parts) >= 2 and parts[1].isdigit():
+                    item = input_item(f"{parts[0]}:{parts[1]}", "masscan", 0)
+                elif re.match(r"^[^:\s]+:\d+$", parts[0]):
+                    item = input_item(parts[0], "masscan", 0)
+                if item:
+                    targets.append(item)
+    elif input_format == "httpx-json":
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            item = input_item(obj.get("final_url") or obj.get("url") or obj.get("input"),
+                              obj.get("title", ""), obj.get("status_code", 0))
+            if item:
+                targets.append(item)
+    return targets
 
 def target_url_with_scheme(raw):
     raw = (raw or "").strip()
@@ -360,23 +666,25 @@ def reachable_base_url(host, port, preferred_url=None):
         except Exception as e:
             log.debug(f"Scheme probe {base} failed: {e}")
             return False
-    if not tcp_check(host, port):
+    if not args.skip_port_probe and not tcp_check(host, port):
         return None
     if preferred_url:
         if quick_http_ok(preferred_url):
             return preferred_url.rstrip("/")
         parsed = urlparse(preferred_url)
-        other_scheme = "http" if parsed.scheme == "https" else "https"
-        other = format_base_url(host, port, other_scheme)
-        if quick_http_ok(other):
-            return other
-        return preferred_url.rstrip("/")
+        if parsed.scheme in ("http", "https"):
+            other_scheme = "http" if parsed.scheme == "https" else "https"
+            other = format_base_url(host, port, other_scheme)
+            if quick_http_ok(other):
+                return other
+        if args.allow_unverified_url:
+            return preferred_url.rstrip("/")
+        return None
     for scheme in scheme_candidates_for_port(port):
         base = format_base_url(host, port, scheme)
         if quick_http_ok(base):
             return base
-    guessed = "https" if port in HTTPS_PORTS else "http"
-    return format_base_url(host, port, guessed)
+    return None
 
 def is_file_endpoint(path):
     parts = re.split(r'[^A-Za-z0-9]+', path.split("?", 1)[0])
@@ -817,6 +1125,11 @@ def has_body_bound_params(profile, path):
         return False
     return bool(bound_param_names_by_source(profile, path, "json") or bound_param_names_by_source(profile, path, "form"))
 
+def has_bound_params(profile, path):
+    if not profile:
+        return False
+    return bool(bound_param_names(profile, path) or has_body_bound_params(profile, path))
+
 def body_probe_bypass_tests(profile, path):
     tests = []
     if bound_param_names_by_source(profile, path, "json"):
@@ -825,9 +1138,25 @@ def body_probe_bypass_tests(profile, path):
         tests.append(("POST_FORM_no_auth","POST","application/x-www-form-urlencoded",lambda p: urlencode(p).encode(),{}))
     return tests
 
-def unique_apis(items):
+def static_priority_apis(t, limit=30):
+    apis = list(t.get("apis", []))
+    picked = [api for api in apis if -api_priority(api)[0] >= 70]
+    paths = {api.split("?")[0].rstrip("/"): api for api in apis}
+    suffix_picked = []
+    for api in picked:
+        clean = api.split("?")[0].rstrip("/")
+        parts = [p for p in clean.strip("/").split("/") if p]
+        for idx in range(1, min(3, len(parts))):
+            suffix = "/" + "/".join(parts[idx:])
+            if suffix in paths and -api_priority(suffix)[0] >= 70:
+                suffix_picked.append(paths[suffix])
+    return unique_apis(sorted(picked, key=api_priority)[:limit] + suffix_picked)
+
+def phase3_seed_apis(t):
+    apis = list(t.get("apis", []))
+    seed = list(apis[:30]) + static_priority_apis({"apis": apis}) + BASELINE_PATHS
     seen, out = set(), []
-    for api in items:
+    for api in sorted(seed, key=api_priority):
         clean = api.split("?")[0].rstrip("/")
         if not clean or clean in seen:
             continue
@@ -835,24 +1164,125 @@ def unique_apis(items):
         out.append(api)
     return out
 
+def unique_apis(items):
+    best = {}
+    for api in items:
+        clean = api.split("?")[0].rstrip("/")
+        if not clean:
+            continue
+        current = best.get(clean)
+        if current is None or api_priority(api) < api_priority(current):
+            best[clean] = api
+    return sorted(best.values(), key=api_priority)
+
+def drop_prefixed_duplicates(apis):
+    paths = {api.split("?")[0].rstrip("/") for api in apis}
+    out = []
+    for api in apis:
+        clean = api.split("?")[0].rstrip("/")
+        parts = [p for p in clean.strip("/").split("/") if p]
+        duplicate = False
+        for idx in range(1, min(3, len(parts))):
+            suffix = "/" + "/".join(parts[idx:])
+            if suffix in paths and api_priority(suffix) <= api_priority(clean):
+                duplicate = True
+                break
+        if not duplicate:
+            out.append(api)
+    return out
+
 def business_layer_apis(t):
-    apis = [api for api in t["apis"][:80] if not is_file_endpoint(api)]
-    bound = [api for api in t["apis"] if has_body_bound_params(t.get("param_profile"), api)]
+    all_apis = drop_prefixed_duplicates(t["apis"])
+    apis = [api for api in all_apis[:80] if not is_file_endpoint(api)]
+    bound = [api for api in all_apis if has_body_bound_params(t.get("param_profile"), api)]
     return unique_apis(apis + bound)
 
 def file_layer_apis(t):
-    apis = [api for api in t["apis"][:80] if is_file_endpoint(api)]
-    bound_files = [api for api in t["apis"] if is_file_endpoint(api) and (has_body_bound_params(t.get("param_profile"), api) or should_param_probe(api, t.get("param_profile")))]
+    all_apis = drop_prefixed_duplicates(t["apis"])
+    apis = [api for api in all_apis[:80] if is_file_endpoint(api)]
+    bound_files = [api for api in all_apis if is_file_endpoint(api) and (has_body_bound_params(t.get("param_profile"), api) or should_param_probe(api, t.get("param_profile")))]
     return unique_apis(apis + bound_files)
+
+def normalize_extracted_api(path):
+    path = (path or "").strip().strip('"\'`')
+    if not path or path.startswith(("data:", "javascript:", "mailto:", "#")):
+        return ""
+    if path.startswith(("http:", "https:", "//")):
+        return ""
+    if not path.startswith("/"):
+        path = "/" + path
+    path = path.split("?")[0].split("#")[0].rstrip("/")
+    if not (2 < len(path) < 250):
+        return ""
+    if "\ufffd" in path or re.search(r"[\x00-\x1f\x7f\s]", path):
+        return ""
+    if not re.search(r"[A-Za-z0-9]", path):
+        return ""
+    if re.search(r"[^\w./{}:$@%+=,;&?~!()\\[\\]\-\u4e00-\u9fff]", path, re.UNICODE):
+        return ""
+    if os.path.splitext(path)[1].lower() in ('.js','.mjs','.ts','.tsx','.jsx','.vue','.css','.png','.jpg','.gif','.svg','.ico','.woff','.woff2','.ttf','.eot','.map','.json','.xml','.html','.pdf'):
+        return ""
+    return path
+
+def valid_sensitive_value(value):
+    value = (value or "").strip()
+    if len(value) < 8 or len(value) > 200:
+        return False
+    if re.search(r"\s", value):
+        return False
+    if any(ch in value for ch in "{}[]();,"):
+        return False
+    if value.count("+") > 1:
+        return False
+    alnum = sum(ch.isalnum() for ch in value)
+    if alnum < 6:
+        return False
+    return True
+
+def js_string_constants(content):
+    constants = {}
+    if not content:
+        return constants
+    for decl in re.finditer(r'''(?:const|let|var)\s+([^;]{1,400});''', content):
+        for m in re.finditer(r'''([A-Za-z_$][\w$]{0,60})\s*=\s*["']([^"']{1,240})["']''', decl.group(1)):
+            value = normalize_extracted_api(m.group(2))
+            if value:
+                constants[m.group(1)] = value.rstrip("/") + ("/" if m.group(2).rstrip().endswith("/") else "")
+    return constants
+
+def join_api_parts(left, right):
+    left = normalize_extracted_api(left)
+    right = (right or "").strip().strip('"\'`')
+    if not left or not right or right.startswith(("http:", "https:", "//", "data:", "javascript:", "#")):
+        return ""
+    joined = left.rstrip("/") + "/" + right.lstrip("/")
+    return normalize_extracted_api(joined)
+
+def extract_concatenated_apis(content):
+    apis = set()
+    constants = js_string_constants(content)
+    if not constants:
+        return apis
+    var_names = "|".join(re.escape(k) for k in sorted(constants, key=len, reverse=True))
+    suffix = r'''["']([A-Za-z0-9_.$@%+=,;&?~!()/\-\u4e00-\u9fff]{1,160})["']'''
+    patterns = [
+        re.compile(r'''(?:url|path)\s*:\s*(%s)\s*\+\s*%s''' % (var_names, suffix), re.I),
+        re.compile(r'''\.(?:get|post|put|delete|patch)\s*\(\s*(%s)\s*\+\s*%s''' % (var_names, suffix), re.I),
+        re.compile(r'''fetch\s*\(\s*(%s)\s*\+\s*%s''' % (var_names, suffix), re.I),
+        re.compile(r'''(?:request|axios|service|http)\s*\(\s*\{\s*url\s*:\s*(%s)\s*\+\s*%s''' % (var_names, suffix), re.I),
+    ]
+    for pat in patterns:
+        for m in pat.finditer(content):
+            path = join_api_parts(constants.get(m.group(1), ""), m.group(2))
+            if path:
+                apis.add(path)
+    return apis
 
 def extract_apis(js_content):
     apis = set()
     for m in LINKFINDER_RE.finditer(js_content):
-        path = m.group(0).strip('"\'`')
-        if path.startswith(("http:","https:","//")): continue
-        if not path.startswith("/"): path = "/" + path
-        path = path.split("?")[0].split("#")[0].rstrip("/")
-        if 2 < len(path) < 250 and os.path.splitext(path)[1].lower() not in ('.js','.css','.png','.jpg','.gif','.svg','.ico','.woff','.woff2','.ttf','.eot','.map','.json','.xml','.html','.pdf'):
+        path = normalize_extracted_api(m.group(0))
+        if path:
             apis.add(path)
     for m in WEBPACK_CHUNK_RE.finditer(js_content):
         apis.add(m.group(0)[:200])
@@ -863,30 +1293,77 @@ def extract_apis(js_content):
         re.compile(r'''["'](/api/[a-zA-Z][a-zA-Z0-9_/\-.]{2,200})["']''', re.I),
     ]:
         for m in pat.finditer(js_content):
-            path = m.group(1).strip()
-            if not path or path.startswith(("http:","https:","//")): continue
-            if not path.startswith("/"): path = "/" + path
-            path = path.split("?")[0].rstrip("/")
-            if 2 < len(path) < 250 and os.path.splitext(path)[1].lower() not in ('.js','.css','.png','.jpg','.gif','.svg','.ico','.woff','.woff2','.ttf','.eot','.map','.json','.xml','.html','.pdf'):
+            path = normalize_extracted_api(m.group(1))
+            if path:
                 apis.add(path)
+    apis.update(extract_concatenated_apis(js_content))
     return apis
+
+def is_module_asset_path(href):
+    href = (href or "").strip()
+    if not href or href.startswith(("data:", "javascript:", "mailto:", "#")):
+        return False
+    path = urlparse(href).path if href.startswith(("http://", "https://", "//")) else href.split("?", 1)[0].split("#", 1)[0]
+    if STATIC_ASSET_RE.search(path):
+        return False
+    return bool(MODULE_ASSET_RE.search(path))
+
+def extract_module_urls_from_content(content, base_url):
+    urls = set()
+    if not content:
+        return urls
+    patterns = [
+        re.compile(r'''(?:import|export)(?:\s+|(?=[\{\*]))(?:[^"']{0,240}?\s*from\s*)?["']([^"']{1,240})["']''', re.I),
+        re.compile(r'''import\s*\(\s*["']([^"']{1,240})["']\s*\)''', re.I),
+        re.compile(r'''new\s+URL\s*\(\s*["']([^"']{1,240})["']\s*,\s*import\.meta\.url\s*\)''', re.I),
+    ]
+    for pat in patterns:
+        for m in pat.finditer(content):
+            spec = m.group(1).strip()
+            if not spec.startswith((".", "/", "@")):
+                continue
+            if spec.startswith("@/"):
+                spec = "/src/" + spec[2:]
+            if is_module_asset_path(spec) or spec.startswith(("./", "../", "/src/", "/@vite/", "/@id/")):
+                urls.add(urljoin(base_url, spec))
+    for m in re.finditer(r'''["']([^"']*?(?:^|/)?js/[A-Za-z0-9_.-]+\.js(?:\?[^"']*)?)["']''', content):
+        urls.add(urljoin(base_url, m.group(1).strip()))
+    return urls
 
 def extract_js_from_html(html, base_url):
     js_urls = set()
+    def add_js_href(href, module=False):
+        href = (href or "").strip()
+        if not href:
+            return
+        if module or is_module_asset_path(href):
+            js_urls.add(urljoin(base_url, href))
     if HAS_BS4:
         try:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, 'html.parser')
             for script in soup.find_all('script', src=True):
-                js_urls.add(urljoin(base_url, script['src']))
-            for link in soup.find_all('link', rel=['preload','prefetch','modulepreload']):
-                href = link.get('href','')
-                if href.endswith('.js'): js_urls.add(urljoin(base_url, href))
+                script_type = str(script.get('type') or "").lower()
+                add_js_href(script.get('src', ''), module=("module" in script_type))
+            for link in soup.find_all('link', href=True):
+                rels = link.get('rel') or []
+                if isinstance(rels, str):
+                    rels = re.split(r'\s+', rels.strip())
+                rels = {str(r).lower() for r in rels}
+                if rels & {"preload", "prefetch", "modulepreload"}:
+                    add_js_href(link.get('href', ''))
         except Exception as e:
             log.debug(f"BS4 parse failed: {e}")
-    else:
-        for m in re.finditer(r'<script[^>]+src\s*=\s*["\x27]?([^"\'<>\s]+\.js[^"\'<>\s]*)["\x27]?', html, re.I):
-            js_urls.add(urljoin(base_url, m.group(1)))
+    for m in re.finditer(r'<script[^>]+src\s*=\s*["\x27]?([^"\'<>\s]+\.js(?:\?[^"\'<>\s]*)?)[ "\x27>]?', html, re.I):
+        add_js_href(m.group(1))
+    for m in re.finditer(r'<script[^>]+src\s*=\s*["\x27]?([^"\'<>\s]+)["\x27]?[^>]*type\s*=\s*["\x27]?module["\x27]?', html, re.I):
+        add_js_href(m.group(1), module=True)
+    for m in re.finditer(r'<script[^>]+type\s*=\s*["\x27]?module["\x27]?[^>]+src\s*=\s*["\x27]?([^"\'<>\s]+)["\x27]?', html, re.I):
+        add_js_href(m.group(1), module=True)
+    for m in re.finditer(r'<link[^>]+rel\s*=\s*["\x27]?[^"\'>]*(?:prefetch|preload|modulepreload)[^"\'>]*["\x27]?[^>]+href\s*=\s*["\x27]?([^"\'<>\s]+\.js(?:\?[^"\'<>\s]*)?)["\x27]?', html, re.I):
+        add_js_href(m.group(1))
+    for m in re.finditer(r'<link[^>]+href\s*=\s*["\x27]?([^"\'<>\s]+\.js(?:\?[^"\'<>\s]*)?)["\x27]?[^>]+rel\s*=\s*["\x27]?[^"\'>]*(?:prefetch|preload|modulepreload)[^"\'>]*["\x27]?', html, re.I):
+        add_js_href(m.group(1))
     for pat in [WEBPACK_CHUNK_RE, re.compile(r'''["']([^"']*?(?:static/js|js)/[^"']+\.js)["']'''), re.compile(r'''["']([^"']*?js/[a-zA-Z][a-zA-Z0-9_\-\.]+\.js)["']''')]:
         for m in pat.finditer(html):
             chunk = str(m.group(0)).strip('"\'')
@@ -1020,13 +1497,16 @@ def api_priority(path):
     p = path.lower()
     score = 0
     weighted = [
+        (180, ["system.login","login/setting","/large/index/"]),
+        (130, ["captcha","statistics","message"]),
         (120, ["media_server","gb28181","rtsp","streamurl","playurl","wvp"]),
         (100, ["camera","video","stream","media","play","live","channel","device"]),
         (95, ["phone","mobile","idcard","identity","realname","citizen","resident"]),
         (85, ["user","person","people","email","address"]),
         (75, ["config","system","admin","role","permission","auth","token","password","secret"]),
+        (72, ["system.login","login/setting","captcha","large/index","statistics","dashboard","bigscreen","screen"]),
         (50, ["file","upload","download","export","import","backup"]),
-        (40, ["alarm","alert","record","log","history","trace"]),
+        (40, ["alarm","alert","message","record","log","history","trace"]),
         (35, ["swagger","api-docs","druid","actuator","openapi"]),
         (25, ["list","query","search","page","all"]),
     ]
@@ -1068,12 +1548,60 @@ def risk_level(fi):
         if any(k in keys_str for k in ['phone','email','address','idcard','身份证']): score += 3
         if any(k in keys_str for k in ['camera','cameraid','deviceid','stream','streamurl','rtsp','playurl','channel','gb28181']):
             score += 3
+        if any(k in keys_str for k in ['unit_number','unit_name','unit_type','user_name','jurisdiction','inspection','alarm','alert']):
+            score += 3
         if any(k in keys_str for k in ['plate','plateno','latitude','longitude','lng','lat','gps']):
             score += 2
     if score >= 5: return 'CRITICAL'
     if score >= 3: return 'HIGH'
     if score >= 1 or attack_path: return 'MEDIUM'
     return 'LOW'
+
+def json_data_keys(obj, max_keys=30, depth=0):
+    keys = []
+    seen = set()
+    def add(key):
+        key = str(key)
+        if key and key not in seen and len(keys) < max_keys:
+            seen.add(key)
+            keys.append(key)
+    def walk(item, level):
+        if level > 4 or len(keys) >= max_keys:
+            return
+        if isinstance(item, dict):
+            for k, v in item.items():
+                add(k)
+                if isinstance(v, (dict, list)):
+                    walk(v, level + 1)
+        elif isinstance(item, list):
+            for child in item[:5]:
+                if isinstance(child, (dict, list)):
+                    walk(child, level + 1)
+    walk(obj, depth)
+    return keys
+
+def json_data_count(obj, depth=0):
+    if depth > 4:
+        return 0
+    if isinstance(obj, list):
+        return len(obj)
+    if isinstance(obj, dict):
+        for value in obj.values():
+            count = json_data_count(value, depth + 1)
+            if count:
+                return count
+    return 0
+
+def is_framework_not_found_json(parsed):
+    if not isinstance(parsed, dict):
+        return False
+    msg = " ".join(str(parsed.get(k, "")) for k in ("msg", "message", "error", "detail", "reason"))
+    data = parsed.get("data")
+    if isinstance(data, dict):
+        msg += " " + " ".join(str(data.get(k, "")) for k in ("msg", "message", "error", "repMsg", "detail", "reason"))
+        has_stack = ("trace" in data and ("file" in data or "line" in data)) or ("file" in data and "line" in data)
+        return bool(has_stack and FRAMEWORK_NOT_FOUND_RE.search(msg))
+    return False
 
 def check_response(body, url, method, test_name, status_code=None):
     if len(body) < 20: return None
@@ -1087,6 +1615,7 @@ def check_response(body, url, method, test_name, status_code=None):
         code_val = next((parsed[k] for k in ("code","statusCode","status") if k in parsed and parsed[k] is not None), "")
         code = str(code_val)
         msg = str(parsed.get("msg","") or parsed.get("message",""))
+        if is_framework_not_found_json(parsed): return None
         if code in ("10031","401","403","500002","40001"): return None
         if is_auth_failure_json(parsed): return None
         d = parsed.get("data")
@@ -1107,12 +1636,19 @@ def check_response(body, url, method, test_name, status_code=None):
                 if data_source:
                     break
         has_data = (isinstance(data_source, list) and len(data_source)>0) or (isinstance(data_source, dict) and data_source and set(data_source.keys())-{"path","time","timestamp","error","status"})
-        if has_data or code in ("0","200","20000") or attack_path_ok:
+        success_with_payload = code in ("0","200","20000") and data_source not in (None, "", [], {})
+        if isinstance(data_source, dict) and not (set(data_source.keys()) - {"path","time","timestamp","error","status"}):
+            success_with_payload = False
+        if has_data or success_with_payload or attack_path_ok:
             f = {"url":url,"method":method,"test":test_name,"code":code,"msg":msg[:200]}
             if isinstance(data_source, list):
                 f["data_count"]=len(data_source)
-                if data_source and isinstance(data_source[0], dict): f["data_keys"] = list(data_source[0].keys())[:15]
-            elif isinstance(data_source, dict): f["data_keys"]=list(data_source.keys())[:15]
+                if data_source and isinstance(data_source[0], dict): f["data_keys"] = json_data_keys(data_source)
+            elif isinstance(data_source, dict):
+                f["data_keys"]=json_data_keys(data_source)
+                count = json_data_count(data_source)
+                if count:
+                    f["data_count"] = count
             if "secret" in body.lower() or "password" in body.lower(): f["credential_leak"]=True
             f["risk"] = risk_level(f)
             f["raw"] = body[:500]
@@ -1163,36 +1699,36 @@ def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=Non
                 data = None
                 if method in ("POST","PUT","PATCH") and bf:
                     data = bf(payload or {"page":"1","size":"10"})
-                h = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
+                h = {"User-Agent":"Mozilla/5.0","Accept":"application/json","Accept-Encoding":http_accept_encoding()}
                 h.update(headers)
                 if data and ct: h["Content-Type"] = ct
                 req = Request(url, data=data, headers=h, method=method)
                 resp = urlopen(req, timeout=API_TIMEOUT, context=ssl_ctx)
-                raw = read_limited(resp)
+                _, body_bytes, body = read_http_response(resp)
                 if not args.disable_file_hunter:
-                    ff = check_file_response(raw, resp.headers, url, method, name, resp.getcode())
+                    ff = check_file_response(body_bytes, resp.headers, url, method, name, resp.getcode())
                     if ff:
                         findings.append(ff)
-                        if short_circuit: return findings
-                body = raw.decode('utf-8', errors='replace')
+                        if short_circuit and should_short_circuit_finding(ff): return findings
                 f = check_response(body, url, method, name, resp.getcode())
                 if f:
                     findings.append(f)
-                    if short_circuit: return findings
+                    if short_circuit and should_short_circuit_finding(f): return findings
             except HTTPError as e:
                 if e.code not in (404,403,405):
                     try:
-                        raw = e.read()
+                        raw = read_limited(e)
+                        body_bytes = _maybe_decompress_http_body(raw, e.headers)
                         if not args.disable_file_hunter:
-                            ff = check_file_response(raw, e.headers, url, method, name, e.code)
+                            ff = check_file_response(body_bytes, e.headers, url, method, name, e.code)
                             if ff:
                                 findings.append(ff)
-                                if short_circuit: return findings
-                        b = raw.decode('utf-8', errors='replace')
+                                if short_circuit and should_short_circuit_finding(ff): return findings
+                        b = decode_http_body(raw, e.headers)
                         f = check_response(b, url, method, name, e.code)
                         if f:
                             findings.append(f)
-                            if short_circuit: return findings
+                            if short_circuit and should_short_circuit_finding(f): return findings
                     except: pass
             except Exception as e:
                 log.debug(f"API {url} {method} failed: {e}")
@@ -1308,6 +1844,14 @@ def merge_findings(existing, new_items):
 def useful_findings(findings):
     return [f for f in findings if f.get("data_count") or f.get("data_keys") or f.get("credential_leak") or f.get("attack_path_intel") or f.get("file_leak")]
 
+def should_short_circuit_finding(fi):
+    return bool(
+        high_value_finding(fi)
+        or fi.get("credential_leak")
+        or fi.get("file_leak")
+        or fi.get("attack_path_intel")
+    )
+
 def high_value_finding(fi):
     if fi.get("public_download_intel"):
         return False
@@ -1320,10 +1864,13 @@ def high_value_finding(fi):
         "phone","mobile","idcard","身份证","email","address",
         "camera","stream","rtsp","gb28181","deviceid","playurl",
         "password","secret","token","apikey","accesskey","config",
+        "unit_number","unit_name","unit_type","user_name","jurisdiction",
+        "inspection","alarm","alert",
     ])
 
 def report_stats(vulnerable):
     all_findings = [fi for v in vulnerable for fi in v.get("findings", [])]
+    js_intel_count = sum(len(v.get("sensitive") or v.get("js_intel") or []) for v in vulnerable)
     raw_events = sum(int(fi.get("variant_count") or 1) for fi in all_findings)
     aggregated_findings = len(all_findings)
     unique_endpoint_keys = {normalized_endpoint(fi.get("url", "")) for fi in all_findings}
@@ -1342,10 +1889,64 @@ def report_stats(vulnerable):
         "file_leaks": len(file_findings),
         "public_download_intel": len(public_downloads),
         "high_value_findings": sum(1 for fi in all_findings if high_value_finding(fi)),
+        "js_intel": js_intel_count,
     }
 
 def target_filename(base):
     return re.sub(r'[^a-zA-Z0-9]', '_', base) + ".json"
+
+def serialize_param_profile(profile):
+    profile = profile or {}
+    return {
+        "names": sorted(profile.get("names", set())),
+        "seeds": sorted(profile.get("seeds", set())),
+        "file_seeds": sorted(profile.get("file_seeds", set())),
+        "api_params": {path: sorted(names) for path, names in sorted(profile.get("api_params", {}).items())},
+        "api_param_sources": {
+            path: {source: sorted(names) for source, names in sorted(sources.items())}
+            for path, sources in sorted(profile.get("api_param_sources", {}).items())
+        },
+        "api_param_shapes": {
+            path: {
+                source: {parent: sorted(names) for parent, names in sorted(parents.items())}
+                for source, parents in sorted(sources.items())
+            }
+            for path, sources in sorted(profile.get("api_param_shapes", {}).items())
+        },
+        "apis_from_params": sorted(profile.get("_apis_from_params", set())),
+    }
+
+def phase2_inventory_record(t, api_limit=None, param_name_limit=None, seed_limit=None, file_seed_limit=None, include_param_profile=True):
+    profile = serialize_param_profile(t.get("param_profile"))
+    names = profile.get("names", [])
+    seeds = profile.get("seeds", [])
+    file_seeds = profile.get("file_seeds", [])
+    record = {
+        "base": t["base"],
+        "title": t.get("title", ""),
+        "api_count": len(t.get("apis", [])),
+        "apis": list(t.get("apis", [])) if api_limit is None else list(t.get("apis", []))[:api_limit],
+        "js_discovered": t.get("js_discovered", t.get("js_count", 0)),
+        "js_app_candidates": t.get("js_app_candidates", t.get("js_count", 0)),
+        "js_attempted": t.get("js_attempted", t.get("js_count", 0)),
+        "js_count": t.get("js_count", 0),
+        "js_intel": sorted(t.get("sensitive") or t.get("js_intel") or []),
+        "fallback": t.get("fallback", ""),
+        "param_name_count": len(names),
+        "param_names": names if param_name_limit is None else names[:param_name_limit],
+        "seed_value_count": len(seeds),
+        "seed_values": seeds if seed_limit is None else seeds[:seed_limit],
+        "file_seed_count": len(file_seeds),
+        "file_seed_values": file_seeds if file_seed_limit is None else file_seeds[:file_seed_limit],
+    }
+    if include_param_profile:
+        record["param_profile"] = profile
+    return record
+
+def write_phase2_inventory(t):
+    with open(os.path.join(OUTDIR, PHASE2_INVENTORY_NAME), "a") as f:
+        json.dump(phase2_inventory_record(t), f, ensure_ascii=False)
+        f.write("\n")
 
 def write_target_result(t):
     findings = t.get("findings", [])
@@ -1353,7 +1954,15 @@ def write_target_result(t):
         return
     t["finding_count"] = len(findings)
     t["raw_event_count"] = sum(int(fi.get("variant_count") or 1) for fi in findings)
+    if t.get("sensitive") and not t.get("js_intel"):
+        t["js_intel"] = sorted(t.get("sensitive", []))
     out = {k: v for k, v in t.items() if k not in ("_f", "_f3a_real", "_deep", "_seen_tasks")}
+    if "param_profile" in out:
+        out["param_profile"] = serialize_param_profile(out.get("param_profile"))
+    if "sensitive" in out:
+        out["sensitive"] = sorted(out.get("sensitive") or [])
+    if "js_intel" in out:
+        out["js_intel"] = sorted(out.get("js_intel") or [])
     with open(os.path.join(OUTDIR, target_filename(t["base"])), "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=2, default=str)
 
@@ -1387,6 +1996,19 @@ def add_task(tasks, seen, t, api, layer):
         return
     seen.add(key)
     tasks.append((t, api, layer))
+
+def finding_endpoint_paths(findings, high_value_only=False):
+    paths = set()
+    for fi in findings or []:
+        if high_value_only and not high_value_finding(fi):
+            continue
+        url = fi.get("url", "")
+        if not url:
+            continue
+        path = urlparse(url).path.rstrip("/")
+        if path:
+            paths.add(path)
+    return paths
 
 def run_task_pool(tasks, worker_count, timeout, label, fn, on_result, progress_every=500):
     if not tasks:
@@ -1425,45 +2047,50 @@ def run_task_pool(tasks, worker_count, timeout, label, fn, on_result, progress_e
 # ===== 主流程 =====
 def main():
     print("="*60)
-    print(f"v13: URL参数绑定+POST body/form增强 | {'全量绕过' if args.full_bypass else '命中断路'} | 风险分级 | Markdown报告")
+    mode = "FULL绕过+全变体" if args.collect_all_variants else "FULL绕过+命中断路" if args.full_bypass else "FAST绕过+命中断路"
+    print(f"v13: URL参数绑定+POST body/form增强 | {mode} | 风险分级 | Markdown报告")
     if args.debug: print(f"  debug=ON workers={WORKERS} timeout={HTTP_TIMEOUT}s")
     print("="*60)
 
-    with open(args.input) as f:
-        targets_raw = json.load(f)
-    targets = [(t['url'], t.get('title',''), t.get('score',0)) for t in targets_raw]
+    targets = dedupe_targets(load_targets(args.input, args.input_format))
     if args.limit > 0: targets = targets[:args.limit]
-    print(f"\n[*] 目标: {len(targets)} | 输入: {args.input} | 输出: {OUTDIR}")
+    print(f"\n[*] 目标: {len(targets)} | 输入: {args.input} ({args.input_format}) | 输出: {OUTDIR}")
+    targets = run_port_discovery(targets)
 
-    # Phase 1: TCP
-    print(f"\n[Phase 1] TCP探测...")
-    live, done = [], 0
-    def probe(t_url):
-        normalized, host, port = target_url_with_scheme(t_url)
-        if normalized and host and port:
-            base = reachable_base_url(host, port, normalized)
-            return [base] if base else []
-        elif host:
-            bases = []
-            for port in WEB_PORTS:
-                base = reachable_base_url(host, port)
-                if base:
-                    bases.append(base)
-            return bases
-        return []
-    with ThreadPoolExecutor(max_workers=WORKERS*4) as pool:
-        futures = {pool.submit(probe, t[0]): t for t in targets}
-        for f in as_completed(futures):
-            done += 1
-            if done % 50 == 0: print(f"  [{done}/{len(targets)}] {len(live)} live")
-            try:
-                r = f.result()
-                for item in r or []:
-                    if item and item not in live:
-                        live.append(item)
-            except Exception as e:
-                log.debug(f"Probe failed: {e}")
-    print(f"  存活: {len(live)}")
+    # Phase 1: HTTP/scheme normalization
+    live = run_httpx_probe(targets)
+    if live is None:
+        print(f"\n[Phase 1] HTTP确认+scheme规范化{' (skip TCP)' if args.skip_port_probe else ''}...")
+        live, done = [], 0
+        def probe(t_url):
+            normalized, host, port = target_url_with_scheme(t_url)
+            if normalized and host and port:
+                base = reachable_base_url(host, port, normalized)
+                return [base] if base else []
+            elif host:
+                bases = []
+                for port in WEB_PORTS:
+                    base = reachable_base_url(host, port)
+                    if base:
+                        bases.append(base)
+                return bases
+            return []
+        with ThreadPoolExecutor(max_workers=WORKERS*4) as pool:
+            futures = {pool.submit(probe, t[0]): t for t in targets}
+            for f in as_completed(futures):
+                done += 1
+                if done % 50 == 0: print(f"  [{done}/{len(targets)}] {len(live)} live")
+                try:
+                    r = f.result()
+                    for item in r or []:
+                        if item and item not in live:
+                            live.append(item)
+                except Exception as e:
+                    log.debug(f"Probe failed: {e}")
+        print(f"  存活: {len(live)}")
+    else:
+        print(f"\n[Phase 1] HTTP确认+scheme规范化: 使用httpx结果")
+        print(f"  存活: {len(live)}")
 
     # Phase 2: JS爬取
     print(f"\n[Phase 2] JS爬取+API提取...")
@@ -1478,10 +2105,12 @@ def main():
         param_profile = empty_param_profile()
         status, final_url, html, ct = http_get(page_url, retries=0)
         swagger_apis = collect_swagger_apis(base)
-        if not status or not html:
+        if status is None:
+            return None
+        if not html:
             apis = set(BASELINE_PATHS) | swagger_apis
             apis = expand_with_prefixes(apis, path_prefixes)
-            return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"sensitive":[],"js_count":0,"param_profile":param_profile}
+            return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"sensitive":[],"js_count":0,"param_profile":param_profile,"fallback":"empty_http_response"}
         merge_param_profiles(param_profile, extract_param_profile(html))
         title = ""
         m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
@@ -1497,21 +2126,47 @@ def main():
         for s in inline_scripts:
             if s.strip():
                 all_apis.update(extract_apis(s))
+                js_urls.update(extract_module_urls_from_content(s, page_url))
                 path_prefixes.update(extract_prefixes_from_content(s))
                 merge_param_profiles(param_profile, extract_param_profile(s))
         if VUE_INSTANCE_RE.search(html):
             for m in VUE_ROUTER_RE.finditer(html): all_apis.add(m.group(1))
         for m in REACT_ROUTE_RE.finditer(html): all_apis.add(m.group(1))
-        app_js = [j for j in js_urls if not COMMON_LIBS.search(j)]
-        for js_url in list(app_js)[:30]:
-            s, _, content, _ = http_get(js_url, max_size=500_000, retries=0)
-            if s != 200 or not content: continue
-            all_apis.update(extract_apis(content))
-            path_prefixes.update(extract_prefixes_from_content(content))
-            merge_param_profiles(param_profile, extract_param_profile(content))
-            for m in SENSITIVE_FIELD_RE.finditer(content): all_apis.add(f"SENSITIVE:{m.group(1)[:100]}")
-            for m in INTERNAL_IP_RE.finditer(content): all_apis.add(f"INTERNAL_IP:{m.group(0)}")
-            for m in JDBC_RE.finditer(content): all_apis.add(f"JDBC:{m.group(0)}")
+        downloaded_js = set()
+        successful_js = set()
+        js_limit = args.js_max_download
+        def harvest_js(js_candidates, max_items):
+            count = 0
+            queue = sorted(js_candidates)
+            queued = set(queue)
+            while queue:
+                js_url = queue.pop(0)
+                if js_url in downloaded_js or COMMON_LIBS.search(js_url):
+                    continue
+                if max_items > 0 and count >= max_items:
+                    break
+                downloaded_js.add(js_url)
+                count += 1
+                s, _, content, _ = http_get(js_url, max_size=500_000, retries=0)
+                if s != 200 or not content:
+                    continue
+                successful_js.add(js_url)
+                all_apis.update(extract_apis(content))
+                for module_url in sorted(extract_module_urls_from_content(content, js_url)):
+                    js_urls.add(module_url)
+                    if module_url not in queued and module_url not in downloaded_js:
+                        queue.append(module_url)
+                        queued.add(module_url)
+                path_prefixes.update(extract_prefixes_from_content(content))
+                merge_param_profiles(param_profile, extract_param_profile(content))
+                for m in SENSITIVE_FIELD_RE.finditer(content):
+                    value = m.group(1)[:100]
+                    if valid_sensitive_value(value):
+                        all_apis.add(f"SENSITIVE:{value}")
+                for m in INTERNAL_IP_RE.finditer(content): all_apis.add(f"INTERNAL_IP:{m.group(0)}")
+                for m in JDBC_RE.finditer(content): all_apis.add(f"JDBC:{m.group(0)}")
+            return count
+        harvest_js(js_urls, js_limit)
         crawled = set()
         for link in list(links)[:5]:
             if link in crawled: continue
@@ -1524,8 +2179,15 @@ def main():
             for s in re.findall(r'<script[^>]*>([\s\S]*?)</script>', page, re.I):
                 if s.strip():
                     all_apis.update(extract_apis(s))
+                    js_urls.update(extract_module_urls_from_content(s, link))
                     path_prefixes.update(extract_prefixes_from_content(s))
                     merge_param_profiles(param_profile, extract_param_profile(s))
+        if js_limit > 0:
+            remaining = max(0, js_limit - len(downloaded_js))
+            if remaining > 0:
+                harvest_js(js_urls, remaining)
+        else:
+            harvest_js(js_urls, 0)
         # 将参数画像提取到的URL补充进API集合
         for extra_api in param_profile.get("_apis_from_params", set()):
             if extra_api.startswith("/"):
@@ -1537,7 +2199,15 @@ def main():
         clean = sorted((a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))), key=api_priority)
         sensitive = [a for a in all_apis if a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))]
         if not clean: return None
-        return {"base":base,"title":title,"apis":clean,"sensitive":sensitive,"js_count":len(app_js),"param_profile":param_profile}
+        app_js_count = sum(1 for js in js_urls if not COMMON_LIBS.search(js))
+        return {
+            "base":base,"title":title,"apis":clean,"sensitive":sensitive,
+            "js_count":len(successful_js),
+            "js_discovered":len(js_urls),
+            "js_app_candidates":app_js_count,
+            "js_attempted":len(downloaded_js),
+            "param_profile":param_profile,
+        }
 
     pool = ThreadPoolExecutor(max_workers=WORKERS)
     try:
@@ -1555,7 +2225,9 @@ def main():
                 done += 1
                 try:
                     r = f.result()
-                    if r: api_results.append(r)
+                    if r:
+                        api_results.append(r)
+                        write_phase2_inventory(r)
                 except Exception as e:
                     log.debug(f"Crawl failed: {e}")
                 if done % 10 == 0 or done == len(live): print(f"  [{done}/{len(live)}] {len(api_results)} with APIs")
@@ -1565,36 +2237,39 @@ def main():
                 url = futures[f]
                 f.cancel()
                 done += 1
-                api_results.append(baseline_api_result(url))
+                fallback = baseline_api_result(url)
+                api_results.append(fallback)
+                write_phase2_inventory(fallback)
             print(f"  [{done}/{len(live)}] {len(api_results)} with APIs")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     print(f"  Phase 2 DONE: {len(api_results)} hosts")
+    print(f"  Phase 2 inventory: {OUTDIR}/{PHASE2_INVENTORY_NAME}")
 
     if args.dry_run:
         print(f"\n[Dry-run] 跳过测试, 输出API列表")
         with open(os.path.join(OUTDIR, "apis.json"), "w") as f:
-            json.dump([{
-                "base": t["base"],
-                "title": t["title"],
-                "apis": t["apis"][:50],
-                "param_names": sorted(t.get("param_profile", {}).get("names", set()))[:80],
-                "seed_values": sorted(t.get("param_profile", {}).get("seeds", set()))[:40],
-                "file_seed_values": sorted(t.get("param_profile", {}).get("file_seeds", set()))[:40],
-            } for t in api_results], f, ensure_ascii=False, indent=2)
+            json.dump([
+                phase2_inventory_record(
+                    t,
+                    api_limit=50,
+                    param_name_limit=80,
+                    seed_limit=40,
+                    file_seed_limit=40,
+                    include_param_profile=False,
+                )
+                for t in api_results
+            ], f, ensure_ascii=False, indent=2)
         print(f"  API列表: {OUTDIR}/apis.json")
         return
 
     # Phase 3: 两阶段测试
-    print(f"\n[Phase 3] 未授权测试 ({'全量绕过' if args.full_bypass else '命中断路'})...")
+    phase3_mode = "FULL绕过+全变体" if args.collect_all_variants else "FULL绕过+命中断路" if args.full_bypass else "FAST绕过+命中断路"
+    print(f"\n[Phase 3] 未授权测试 ({phase3_mode})...")
     flat_tasks, target_map = [], {}
     for t in api_results:
         target_map[t["base"]] = t; t["_f"] = []
-        seen_apis = set()
-        for api in list(t["apis"][:30]) + BASELINE_PATHS:
-            if api in seen_apis:
-                continue
-            seen_apis.add(api)
+        for api in phase3_seed_apis(t):
             flat_tasks.append((t, api))
     print(f"  3a/fast: {len(flat_tasks)} tasks on {len(target_map)} hosts")
     t_start = time.time()
@@ -1656,6 +2331,37 @@ def main():
         run_task_pool(body_fast_tasks, WORKERS, args.phase3a_timeout, "3a/body-fast", test_body_fast, handle_body_fast)
         print(f"  3a/body-fast 耗时: {time.time()-t_start:.0f}s")
 
+    if args.phase3a_param_rescue:
+        rescue_param_tasks, seen_param_rescue = [], set()
+        max_rescue_apis = max(0, args.phase3a_param_rescue_max_apis)
+        for t in api_results:
+            added = 0
+            for api in t["apis"]:
+                clean_api = api.split("?")[0].rstrip("/")
+                if not clean_api or (t["base"], clean_api) in seen_param_rescue:
+                    continue
+                if not has_bound_params(t.get("param_profile"), clean_api):
+                    continue
+                if not should_param_probe(clean_api, t.get("param_profile")):
+                    continue
+                seen_param_rescue.add((t["base"], clean_api))
+                rescue_param_tasks.append((t, clean_api))
+                added += 1
+                if max_rescue_apis and added >= max_rescue_apis:
+                    break
+        if rescue_param_tasks:
+            print(f"  3a/param-rescue: {len(rescue_param_tasks)} bound-param tasks")
+            t_start = time.time()
+            def test_param_rescue(task):
+                t, api = task
+                return t["base"], test_api(t["base"], api, FAST_BYPASS, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=True)
+            def handle_param_rescue(result):
+                base_url, findings = result
+                if findings:
+                    target_map[base_url]["_f"].extend(findings)
+            run_task_pool(rescue_param_tasks, WORKERS, args.phase3a_timeout, "3a/param-rescue", test_param_rescue, handle_param_rescue)
+            print(f"  3a/param-rescue 耗时: {time.time()-t_start:.0f}s")
+
     candidates = []
     for base, t in target_map.items():
         real = useful_findings(t["_f"])
@@ -1671,7 +2377,7 @@ def main():
         for t in api_results:
             if t["base"] in candidate_bases:
                 continue
-            for api in BASELINE_PATHS:
+            for api in unique_apis(BASELINE_PATHS + static_priority_apis(t)):
                 rescue_tasks.append((t, api))
         if rescue_tasks:
             rescue_bypass = FULL_BYPASS if args.full_bypass else FAST_BYPASS
@@ -1702,7 +2408,7 @@ def main():
             cand_map[t["base"]] = t
 
         layers = [
-            ("baseline", lambda t: BASELINE_PATHS),
+            ("baseline", lambda t: unique_apis(BASELINE_PATHS + static_priority_apis(t))),
             ("business", business_layer_apis),
             ("file", file_layer_apis if not args.disable_file_hunter else lambda t: []),
         ]
@@ -1710,7 +2416,11 @@ def main():
         for layer_name, api_provider in layers:
             layer_tasks, seen_tasks = [], set()
             for t in candidates:
+                hit_paths = finding_endpoint_paths(t.get("findings", []), high_value_only=True) if not args.collect_all_variants else set()
                 for api in api_provider(t):
+                    clean_api = api.split("?")[0].rstrip("/")
+                    if clean_api and clean_api in hit_paths:
+                        continue
                     add_task(layer_tasks, seen_tasks, t, api, layer_name)
             if not layer_tasks:
                 continue
@@ -1718,7 +2428,7 @@ def main():
             t_start = time.time()
             def test_deep_flat(task):
                 t, api, layer = task
-                return t["base"], test_api(t["base"], api, bypass_used, short_circuit=not args.full_bypass, param_profile=t.get("param_profile"))
+                return t["base"], test_api(t["base"], api, bypass_used, short_circuit=not args.collect_all_variants, param_profile=t.get("param_profile"))
             def handle_deep(result):
                 base_url, findings = result
                 if findings:
@@ -1761,6 +2471,7 @@ def main():
     for v in vulnerable:
         report["findings"].append({
             "url":v["base"],"title":v.get("title",""),
+            "js_intel": sorted(v.get("sensitive") or v.get("js_intel") or [])[:100],
             "raw_events":v.get("raw_event_count", sum(int(fi.get("variant_count") or 1) for fi in v.get("findings", []))),
             "aggregated_findings":v.get("finding_count", len(v.get("findings", []))),
             "findings":v.get("findings",[]),
@@ -1780,6 +2491,7 @@ def main():
         f"- 数据类发现: {stats['data_findings']} / 去重数据端点: {stats['unique_data_endpoints']}\n"
         f"- 高价值发现: {stats['high_value_findings']}\n"
         f"- 文件类发现: {stats['file_leaks']} / 公开下载情报: {stats['public_download_intel']}\n"
+        f"- JS 情报: {stats['js_intel']}\n"
     )
     if vulnerable:
         md.append("\n## 漏洞汇总\n\n| # | 风险 | URL | 标题 | raw_events | aggregated_findings |\n|---|------|-----|------|------------|---------------------|")
@@ -1791,6 +2503,11 @@ def main():
         md.append("\n## 详细发现\n")
         for i, v in enumerate(vulnerable):
             md.append(f"### [{i+1}] {v['base']} — {v.get('title','')}")
+            js_intel = sorted(v.get("sensitive") or v.get("js_intel") or [])[:10]
+            if js_intel:
+                md.append("- JS 情报:")
+                for item in js_intel:
+                    md.append(f"  - `{item}`")
             for fi in v.get('findings',[])[:5]:
                 md.append(f"- `{fi.get('method','')}` [{fi.get('risk','?')}] {fi.get('url','')}")
                 if fi.get('data_count'): md.append(f"  - 数据量: {fi['data_count']}")

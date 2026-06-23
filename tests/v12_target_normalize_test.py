@@ -7,9 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCANNER = ROOT / "deep_scanner.py"
-if not SCANNER.exists():
-    SCANNER = ROOT / "scripts" / "pipeline" / "deep_scanner.py"
+SCANNER = ROOT / "pipeline" / "deep_scanner.py"
 
 
 def load_scanner():

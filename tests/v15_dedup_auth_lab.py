@@ -7,9 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
-SCANNER = ROOT / "deep_scanner.py"
-if not SCANNER.exists():
-    SCANNER = ROOT / "scripts" / "pipeline" / "deep_scanner.py"
+SCANNER = ROOT / "pipeline" / "deep_scanner.py"
 
 
 class LabServer(ThreadingHTTPServer):
@@ -107,6 +105,7 @@ def main():
                     "3",
                     "--no-proxy",
                     "--full-bypass",
+                    "--collect-all-variants",
                     "--file-max-probes",
                     "4",
                     "--param-max-probes",

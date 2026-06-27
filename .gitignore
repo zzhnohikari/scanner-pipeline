@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Local scan artifacts and saved target JS/report material.
+reports/
+tools/save_gh_esgcc_hnb_static.py

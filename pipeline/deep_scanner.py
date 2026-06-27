@@ -4,19 +4,36 @@ v13: 文件专项 + HTML/JS静态参数画像 + URL/参数绑定 + POST body/for
 融合 JSFinder/Webpack_extract/VueCrack/Packer-Fuzzer 技术
 """
 
-import os, re, json, time, ssl, socket, argparse, logging, shutil, shlex, subprocess, tempfile, gzip, zlib
+import os, re, json, time, ssl, socket, argparse, logging, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse, urljoin, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
+if PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, PIPELINE_DIR)
+
 try:
-    import brotli as _brotli
+    import pipeline.input_tools as input_tools
+    from pipeline.js_extractor import build_js_graph
+    from pipeline.http_utils import (
+        decode_http_body as _decode_http_body,
+        http_accept_encoding,
+        maybe_decompress_http_body as _maybe_decompress_http_body_impl,
+        read_http_response as _read_http_response,
+        read_limited,
+    )
 except ImportError:
-    try:
-        import brotlicffi as _brotli
-    except ImportError:
-        _brotli = None
+    import input_tools
+    from js_extractor import build_js_graph
+    from http_utils import (
+        decode_http_body as _decode_http_body,
+        http_accept_encoding,
+        maybe_decompress_http_body as _maybe_decompress_http_body_impl,
+        read_http_response as _read_http_response,
+        read_limited,
+    )
 
 def build_parser():
     parser = argparse.ArgumentParser(description='JS/API 未授权访问扫描器 v13')
@@ -241,6 +258,20 @@ BASELINE_PATHS = [
     "/general/login_code_check.php","/e/port/tongji.php",
     "/seeyon/druid/wall.json","/system/admin/user/official/login",
 ]
+HIGH_YIELD_BASELINE_PATHS = [
+    "/api/server/media_server/list",
+    "/druid/basic.json",
+    "/druid/stat.json",
+    "/druid/sql.json",
+    "/druid/wall.json",
+    "/v3/api-docs",
+    "/actuator/env",
+    "/swagger-ui/index.html",
+    "/swagger/index.html",
+    "/seeyon/druid/wall.json",
+    "/api/device/query/devices?page=1&count=10",
+    "/api/server/media_server/online/list",
+]
 SWAGGER_DOC_PATHS = ["/v2/api-docs", "/v3/api-docs", "/openapi.json", "/swagger.json"]
 AUTH_FAIL_MSGS = [
     "缺少请求授权令牌","token无效","未登录","请登录","Unauthorized","Forbidden",
@@ -309,65 +340,14 @@ def tcp_check(host, port):
         log.debug(f"TCP {host}:{port} failed: {e}")
         return False
 
-def _decompress_deflate(body):
-    try:
-        return zlib.decompress(body)
-    except Exception:
-        return zlib.decompress(body, -zlib.MAX_WBITS)
-
 def _maybe_decompress_http_body(body, headers=None):
-    if not body:
-        return body
-    headers = headers or {}
-    content_encoding = str(headers.get("Content-Encoding", "")).lower()
-    tried = []
-    if "gzip" in content_encoding:
-        tried.append(("gzip", gzip.decompress))
-    if "deflate" in content_encoding:
-        tried.append(("deflate", _decompress_deflate))
-    if "br" in content_encoding and _brotli:
-        tried.append(("br", _brotli.decompress))
-    if body[:2] == b"\x1f\x8b" and not any(name == "gzip" for name, _ in tried):
-        tried.append(("gzip", gzip.decompress))
-    if body[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda") and not any(name == "deflate" for name, _ in tried):
-        tried.append(("deflate", _decompress_deflate))
-    for name, func in tried:
-        try:
-            return func(body)
-        except Exception as e:
-            log.debug(f"HTTP body {name} decompress failed: {e}")
-    return body
-
-def http_accept_encoding():
-    return "gzip, deflate" + (", br" if _brotli else "")
-
-def _text_decode_body(raw_bytes, headers=None):
-    headers = headers or {}
-    content_type = str(headers.get("Content-Type", ""))
-    m = re.search(r'charset=([a-zA-Z0-9._-]+)', content_type, re.I)
-    encodings = []
-    if m:
-        encodings.append(m.group(1))
-    for enc in ("utf-8", "gb18030", "latin-1"):
-        if enc not in encodings:
-            encodings.append(enc)
-    for enc in encodings:
-        try:
-            return raw_bytes.decode(enc)
-        except Exception:
-            continue
-    return raw_bytes.decode("utf-8", errors="replace")
+    return _maybe_decompress_http_body_impl(body, headers, log=log)
 
 def decode_http_body(body, headers=None):
-    headers = headers or {}
-    raw = _maybe_decompress_http_body(body, headers)
-    return _text_decode_body(raw, headers)
+    return _decode_http_body(body, headers, log=log)
 
 def read_http_response(resp, max_size=1_000_000):
-    raw = read_limited(resp, max_size=max_size)
-    body_bytes = _maybe_decompress_http_body(raw, resp.headers)
-    text = _text_decode_body(body_bytes, resp.headers)
-    return raw, body_bytes, text
+    return _read_http_response(resp, max_size=max_size, log=log)
 
 def http_get(url, timeout=HTTP_TIMEOUT, max_size=1_000_000, retries=SSL_RETRIES):
     for attempt in range(retries + 1):
@@ -392,16 +372,52 @@ def http_get(url, timeout=HTTP_TIMEOUT, max_size=1_000_000, retries=SSL_RETRIES)
             if attempt == retries: return None, None, "", ""
     return None, None, "", ""
 
-def read_limited(resp, max_size=1_000_000):
-    body = b""
-    while True:
-        chunk = resp.read(65536)
-        if not chunk:
+def phase2_page_quality(html):
+    html = html or ""
+    if not html:
+        return 0
+    head = html[:200_000]
+    lower = head.lower()
+    score = 0
+    if re.search(r"<title[^>]*>[^<]{1,200}</title>", head, re.I):
+        score += 20
+    script_count = len(re.findall(r"<script\b", head, re.I))
+    score += min(script_count, 30) * 3
+    js_ref_count = len(re.findall(r"\.(?:js|mjs|ts|vue)(?:[?#\"']|$)", head, re.I))
+    score += min(js_ref_count, 30) * 2
+    if any(marker in lower for marker in ("id=\"app\"", "id='app'", "__webpack", "__vite", "/@vite/client", "vue", "react")):
+        score += 10
+    if len(html) > 2_000:
+        score += 5
+    if len(html) > 10_000:
+        score += 5
+    return score
+
+def refresh_sparse_phase2_page(page_url, status, final_url, html, content_type):
+    if status is None or phase2_page_quality(html) >= 10:
+        return status, final_url, html, content_type
+    best = (status, final_url, html, content_type)
+    best_score = phase2_page_quality(html)
+    parsed = urlparse(page_url)
+    fallback_urls = [page_url]
+    if parsed.scheme and parsed.netloc:
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path or "/"
+        fallback_urls.extend([
+            origin + "/",
+            origin + "/index.html",
+        ])
+        if path and path != "/":
+            fallback_urls.append(urljoin(page_url if page_url.endswith("/") else page_url + "/", "index.html"))
+    for retry_url in dict.fromkeys(fallback_urls):
+        time.sleep(0.2)
+        candidate = http_get(retry_url, retries=1)
+        candidate_score = phase2_page_quality(candidate[2])
+        if candidate[0] is not None and candidate_score > best_score:
+            best, best_score = candidate, candidate_score
+        if best_score >= 10:
             break
-        body += chunk
-        if len(body) >= max_size:
-            break
-    return body
+    return best
 
 def compact_url(url, max_len=120):
     if len(url) <= max_len:
@@ -411,218 +427,56 @@ def compact_url(url, max_len=120):
     return url[:keep_head] + "..." + url[-keep_tail:]
 
 def input_item(url, title="", score=0):
-    url = str(url or "").strip()
-    if not url:
-        return None
-    return (url, str(title or ""), score or 0)
+    return input_tools.input_item(url, title, score)
 
 def dedupe_targets(items):
-    seen, out = set(), []
-    for item in items or []:
-        if not item:
-            continue
-        key = item[0]
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
+    return input_tools.dedupe_targets(items)
 
 def parse_masscan_item(obj):
-    if not isinstance(obj, dict):
-        return []
-    host = obj.get("ip") or obj.get("host") or obj.get("addr")
-    ports = obj.get("ports") or []
-    out = []
-    if host and isinstance(ports, list):
-        for port_obj in ports:
-            if not isinstance(port_obj, dict):
-                continue
-            port = port_obj.get("port")
-            proto = str(port_obj.get("proto") or port_obj.get("protocol") or "tcp").lower()
-            if port and proto == "tcp":
-                item = input_item(f"{host}:{port}", "masscan", 0)
-                if item:
-                    out.append(item)
-    port = obj.get("port")
-    if host and port:
-        item = input_item(f"{host}:{port}", "masscan", 0)
-        if item:
-            out.append(item)
-    return out
+    return input_tools.parse_masscan_item(obj)
 
 def resolve_tool(name, override=""):
-    if override:
-        if os.path.exists(override) or shutil.which(override):
-            return override
-        return ""
-    candidates = [name]
-    if os.name == "nt" and not name.lower().endswith(".exe"):
-        candidates.append(name + ".exe")
-    for candidate in candidates:
-        found = shutil.which(candidate)
-        if found:
-            return found
-    return ""
+    return input_tools.resolve_tool(name, override)
 
 def require_tool(name, override=""):
-    path = resolve_tool(name, override)
-    if not path:
-        raise RuntimeError(f"Missing external tool: {name}. Install it or pass --{name}-bin /path/to/{name}.")
-    return path
+    return input_tools.require_tool(name, override)
 
 def command_env():
-    env = os.environ.copy()
-    if args.no_proxy:
-        for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-            env.pop(proxy_var, None)
-        env["NO_PROXY"] = "*"
-    return env
+    return input_tools.command_env(no_proxy=args.no_proxy)
 
 def run_command(cmd, label):
-    if args.debug:
-        print(f"  {label}: {' '.join(shlex.quote(str(c)) for c in cmd)}")
-    proc = subprocess.run(cmd, text=True, capture_output=True, env=command_env())
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(f"{label} failed with exit {proc.returncode}: {detail[:1000]}")
-    if args.debug and proc.stderr.strip():
-        log.debug(proc.stderr.strip()[:2000])
-    return proc.stdout
+    return input_tools.run_command(cmd, label, no_proxy=args.no_proxy, debug=args.debug, log=log)
 
 def write_target_lines(path, targets):
-    with open(path, "w", encoding="utf-8") as f:
-        for target, _, _ in targets:
-            if target:
-                f.write(str(target).strip() + "\n")
+    return input_tools.write_target_lines(path, targets)
 
 def run_port_discovery(targets):
-    if args.port_scanner == "none":
-        return targets
-    scanner = args.port_scanner
-    if scanner == "auto":
-        if resolve_tool("masscan", args.masscan_bin):
-            scanner = "masscan"
-        elif resolve_tool("naabu", args.naabu_bin):
-            scanner = "naabu"
-        else:
-            raise RuntimeError("No port scanner found in PATH. Install masscan/naabu or use --port-scanner none.")
-    print(f"\n[Preflight] 端口发现: {scanner} ports={args.scan_ports} rate={args.scan_rate}")
-    with tempfile.TemporaryDirectory(prefix="scanner_ports_") as tmp:
-        in_path = os.path.join(tmp, "targets.txt")
-        out_path = os.path.join(tmp, "ports.out")
-        write_target_lines(in_path, targets)
-        if scanner == "masscan":
-            bin_path = require_tool("masscan", args.masscan_bin)
-            cmd = [bin_path, "-iL", in_path, "-p", args.scan_ports, "--rate", str(args.scan_rate), "-oL", out_path]
-            run_command(cmd, "masscan")
-            discovered = load_targets(out_path, "masscan")
-        elif scanner == "naabu":
-            bin_path = require_tool("naabu", args.naabu_bin)
-            cmd = [bin_path, "-list", in_path, "-p", args.scan_ports, "-rate", str(args.scan_rate), "-silent", "-o", out_path]
-            run_command(cmd, "naabu")
-            discovered = load_targets(out_path, "hostport")
-        else:
-            discovered = targets
-    discovered = dedupe_targets(discovered)
-    print(f"  端口发现结果: {len(discovered)} host:port")
-    return discovered
+    return input_tools.run_port_discovery(
+        targets,
+        port_scanner=args.port_scanner,
+        masscan_bin=args.masscan_bin,
+        naabu_bin=args.naabu_bin,
+        scan_ports=args.scan_ports,
+        scan_rate=args.scan_rate,
+        no_proxy=args.no_proxy,
+        debug=args.debug,
+        log=log,
+    )
 
 def run_httpx_probe(targets):
-    prober = args.http_prober
-    if prober == "internal":
-        return None
-    bin_path = resolve_tool("httpx", args.httpx_bin)
-    if prober == "auto" and not bin_path:
-        print("\n[Preflight] HTTP探测: httpx not found, fallback to internal Phase 1")
-        return None
-    if not bin_path:
-        raise RuntimeError("Missing external tool: httpx. Install ProjectDiscovery httpx or use --http-prober internal.")
-    print(f"\n[Preflight] HTTP探测: httpx")
-    with tempfile.TemporaryDirectory(prefix="scanner_httpx_") as tmp:
-        in_path = os.path.join(tmp, "hostports.txt")
-        out_path = os.path.join(tmp, "httpx.jsonl")
-        write_target_lines(in_path, targets)
-        cmd = [
-            bin_path, "-l", in_path, "-json", "-silent", "-no-color",
-            "-title", "-status-code", "-location", "-follow-host-redirects",
-            "-timeout", str(max(1, HTTP_TIMEOUT)), "-o", out_path,
-        ]
-        if args.httpx_extra_args:
-            cmd.extend(shlex.split(args.httpx_extra_args))
-        run_command(cmd, "httpx")
-        discovered = load_targets(out_path, "httpx-json")
-    discovered = dedupe_targets(discovered)
-    print(f"  HTTP探测结果: {len(discovered)} live URLs")
-    return [item[0] for item in discovered]
+    return input_tools.run_httpx_probe(
+        targets,
+        http_prober=args.http_prober,
+        httpx_bin=args.httpx_bin,
+        httpx_extra_args=args.httpx_extra_args,
+        http_timeout=HTTP_TIMEOUT,
+        no_proxy=args.no_proxy,
+        debug=args.debug,
+        log=log,
+    )
 
 def load_targets(path, input_format):
-    if not os.path.exists(path):
-        return []
-    with open(path, encoding="utf-8") as f:
-        raw = f.read()
-    targets = []
-    if input_format == "targets":
-        data = json.loads(raw)
-        for t in data:
-            if isinstance(t, str):
-                item = input_item(t)
-            else:
-                item = input_item(t.get("url"), t.get("title", ""), t.get("score", 0))
-            if item:
-                targets.append(item)
-    elif input_format == "hostport":
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            item = input_item(parts[0], "hostport", 0)
-            if item:
-                targets.append(item)
-    elif input_format == "masscan":
-        stripped = raw.strip()
-        if stripped.startswith("["):
-            for obj in json.loads(stripped):
-                targets.extend(parse_masscan_item(obj))
-        elif stripped.startswith("{"):
-            for line in raw.splitlines():
-                line = line.strip().rstrip(",")
-                if not line or not line.startswith("{"):
-                    continue
-                try:
-                    targets.extend(parse_masscan_item(json.loads(line)))
-                except Exception:
-                    continue
-        else:
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                item = None
-                if len(parts) >= 4 and parts[0].lower() == "open" and parts[1].lower() == "tcp" and parts[2].isdigit():
-                    item = input_item(f"{parts[3]}:{parts[2]}", "masscan", 0)
-                elif len(parts) >= 2 and parts[1].isdigit():
-                    item = input_item(f"{parts[0]}:{parts[1]}", "masscan", 0)
-                elif re.match(r"^[^:\s]+:\d+$", parts[0]):
-                    item = input_item(parts[0], "masscan", 0)
-                if item:
-                    targets.append(item)
-    elif input_format == "httpx-json":
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            item = input_item(obj.get("final_url") or obj.get("url") or obj.get("input"),
-                              obj.get("title", ""), obj.get("status_code", 0))
-            if item:
-                targets.append(item)
-    return targets
+    return input_tools.load_targets(path, input_format)
 
 def target_url_with_scheme(raw):
     raw = (raw or "").strip()
@@ -1175,6 +1029,16 @@ def unique_apis(items):
             best[clean] = api
     return sorted(best.values(), key=api_priority)
 
+def unique_apis_keep_order(items):
+    seen, out = set(), []
+    for api in items:
+        clean = api.split("?")[0].rstrip("/")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(api)
+    return out
+
 def drop_prefixed_duplicates(apis):
     paths = {api.split("?")[0].rstrip("/") for api in apis}
     out = []
@@ -1195,13 +1059,136 @@ def business_layer_apis(t):
     all_apis = drop_prefixed_duplicates(t["apis"])
     apis = [api for api in all_apis[:80] if not is_file_endpoint(api)]
     bound = [api for api in all_apis if has_body_bound_params(t.get("param_profile"), api)]
-    return unique_apis(apis + bound)
+    priority = static_priority_apis(t, limit=30)
+    return unique_apis_keep_order(bound + priority + apis)
 
 def file_layer_apis(t):
     all_apis = drop_prefixed_duplicates(t["apis"])
     apis = [api for api in all_apis[:80] if is_file_endpoint(api)]
     bound_files = [api for api in all_apis if is_file_endpoint(api) and (has_body_bound_params(t.get("param_profile"), api) or should_param_probe(api, t.get("param_profile")))]
     return unique_apis(apis + bound_files)
+
+def target_priority(t):
+    apis = t.get("apis") or []
+    best_api = api_priority(apis[0])[0] if apis else 0
+    graph_bonus = min(int(t.get("js_graph_edges") or 0), 200)
+    js_bonus = min(int(t.get("js_count") or 0), 80)
+    param_bonus = min(len((t.get("param_profile") or {}).get("api_params", {}) or {}), 80)
+    fallback_penalty = 25 if t.get("fallback") == "empty_http_response" else 0
+    return (best_api - graph_bonus - js_bonus - param_bonus + fallback_penalty, t.get("base", ""))
+
+def target_host(t):
+    host = urlparse(t.get("base", "")).hostname or t.get("base", "")
+    return str(host or "").lower()
+
+def api_score_value(api):
+    return -api_priority(api)[0]
+
+def ordered_targets_for_phase3(items):
+    groups = {}
+    for t in items:
+        groups.setdefault(target_host(t), []).append(t)
+    ordered_groups = []
+    for host, targets in groups.items():
+        ordered = sorted(targets, key=target_priority)
+        ordered_groups.append((target_priority(ordered[0]), host, ordered))
+    ordered_groups.sort(key=lambda x: (x[0], x[1]))
+    out = []
+    index = 0
+    while True:
+        added = False
+        for _, _, targets in ordered_groups:
+            if index < len(targets):
+                out.append(targets[index])
+                added = True
+        if not added:
+            break
+        index += 1
+    return out
+
+def round_robin_tasks(targets, api_provider, layer="", max_per_target=0):
+    per_target = []
+    for t in ordered_targets_for_phase3(targets):
+        apis = list(api_provider(t))
+        if max_per_target and max_per_target > 0:
+            apis = apis[:max_per_target]
+        if not apis:
+            continue
+        per_target.append([(t, api, layer) if layer else (t, api) for api in apis])
+    tasks, seen = [], set()
+    index = 0
+    while True:
+        added = False
+        for group in per_target:
+            if index >= len(group):
+                continue
+            task = group[index]
+            if len(task) == 3:
+                key = (task[0]["base"], task[1], task[2])
+            else:
+                key = (task[0]["base"], task[1])
+            if key not in seen:
+                seen.add(key)
+                tasks.append(task)
+            added = True
+        if not added:
+            break
+        index += 1
+    return tasks
+
+def phase3_seed_tasks(api_results):
+    return round_robin_tasks(api_results, phase3_seed_apis)
+
+def high_yield_probe_apis(t):
+    return unique_apis(HIGH_YIELD_BASELINE_PATHS + static_priority_apis(t, limit=12))
+
+def high_yield_probe_tasks(api_results, exclude_bases=None):
+    exclude_bases = exclude_bases or set()
+    targets = [t for t in api_results if t["base"] not in exclude_bases]
+    return round_robin_tasks(targets, high_yield_probe_apis, max_per_target=8)
+
+def bound_body_tasks(api_results, max_per_target=4):
+    def provider(t):
+        out = []
+        for api in t["apis"]:
+            clean_api = api.split("?")[0].rstrip("/")
+            if not clean_api:
+                continue
+            if not has_body_bound_params(t.get("param_profile"), clean_api):
+                continue
+            if not should_param_probe(clean_api, t.get("param_profile")):
+                continue
+            out.append(clean_api)
+        return unique_apis(out)
+    return round_robin_tasks(api_results, provider, max_per_target=max_per_target)
+
+def bound_param_tasks(api_results, max_per_target=4):
+    def provider(t):
+        out = []
+        for api in t["apis"]:
+            clean_api = api.split("?")[0].rstrip("/")
+            if not clean_api:
+                continue
+            if not has_bound_params(t.get("param_profile"), clean_api):
+                continue
+            if not should_param_probe(clean_api, t.get("param_profile")):
+                continue
+            out.append(clean_api)
+        return unique_apis(out)
+    return round_robin_tasks(api_results, provider, max_per_target=max_per_target)
+
+def layer_tasks_for_candidates(candidates, api_provider, layer_name, collect_all=False):
+    def provider(t):
+        hit_paths = finding_endpoint_paths(t.get("findings", []), high_value_only=True) if not collect_all else set()
+        out = []
+        for api in api_provider(t):
+            clean_api = api.split("?")[0].rstrip("/")
+            keep_bound_body = has_body_bound_params(t.get("param_profile"), clean_api)
+            if clean_api and clean_api in hit_paths and not keep_bound_body:
+                continue
+            out.append(api)
+        return unique_apis_keep_order(out)
+    return round_robin_tasks(candidates, provider, layer=layer_name)
 
 def normalize_extracted_api(path):
     path = (path or "").strip().strip('"\'`')
@@ -1930,6 +1917,7 @@ def phase2_inventory_record(t, api_limit=None, param_name_limit=None, seed_limit
         "js_app_candidates": t.get("js_app_candidates", t.get("js_count", 0)),
         "js_attempted": t.get("js_attempted", t.get("js_count", 0)),
         "js_count": t.get("js_count", 0),
+        "js_graph_edges": t.get("js_graph_edges", 0),
         "js_intel": sorted(t.get("sensitive") or t.get("js_intel") or []),
         "fallback": t.get("fallback", ""),
         "param_name_count": len(names),
@@ -2104,6 +2092,7 @@ def main():
         path_prefixes = path_prefixes_from_url(page_url)
         param_profile = empty_param_profile()
         status, final_url, html, ct = http_get(page_url, retries=0)
+        status, final_url, html, ct = refresh_sparse_phase2_page(page_url, status, final_url, html, ct)
         swagger_apis = collect_swagger_apis(base)
         if status is None:
             return None
@@ -2119,75 +2108,31 @@ def main():
             page_url = final_url
             base = origin_from_url(final_url)
             path_prefixes.update(path_prefixes_from_url(final_url))
-        js_urls = extract_js_from_html(html, page_url)
-        links = extract_links_from_html(html, page_url)
-        inline_scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html, re.I)
         all_apis = set()
-        for s in inline_scripts:
-            if s.strip():
-                all_apis.update(extract_apis(s))
-                js_urls.update(extract_module_urls_from_content(s, page_url))
-                path_prefixes.update(extract_prefixes_from_content(s))
-                merge_param_profiles(param_profile, extract_param_profile(s))
-        if VUE_INSTANCE_RE.search(html):
-            for m in VUE_ROUTER_RE.finditer(html): all_apis.add(m.group(1))
-        for m in REACT_ROUTE_RE.finditer(html): all_apis.add(m.group(1))
-        downloaded_js = set()
-        successful_js = set()
         js_limit = args.js_max_download
-        def harvest_js(js_candidates, max_items):
-            count = 0
-            queue = sorted(js_candidates)
-            queued = set(queue)
-            while queue:
-                js_url = queue.pop(0)
-                if js_url in downloaded_js or COMMON_LIBS.search(js_url):
-                    continue
-                if max_items > 0 and count >= max_items:
-                    break
-                downloaded_js.add(js_url)
-                count += 1
-                s, _, content, _ = http_get(js_url, max_size=500_000, retries=0)
-                if s != 200 or not content:
-                    continue
-                successful_js.add(js_url)
-                all_apis.update(extract_apis(content))
-                for module_url in sorted(extract_module_urls_from_content(content, js_url)):
-                    js_urls.add(module_url)
-                    if module_url not in queued and module_url not in downloaded_js:
-                        queue.append(module_url)
-                        queued.add(module_url)
-                path_prefixes.update(extract_prefixes_from_content(content))
-                merge_param_profiles(param_profile, extract_param_profile(content))
-                for m in SENSITIVE_FIELD_RE.finditer(content):
-                    value = m.group(1)[:100]
-                    if valid_sensitive_value(value):
-                        all_apis.add(f"SENSITIVE:{value}")
-                for m in INTERNAL_IP_RE.finditer(content): all_apis.add(f"INTERNAL_IP:{m.group(0)}")
-                for m in JDBC_RE.finditer(content): all_apis.add(f"JDBC:{m.group(0)}")
-            return count
-        harvest_js(js_urls, js_limit)
-        crawled = set()
-        for link in list(links)[:5]:
-            if link in crawled: continue
-            crawled.add(link)
-            s, _, page, _ = http_get(link, retries=0)
-            if s != 200 or not page or len(page) < 100: continue
-            sub_js = extract_js_from_html(page, link)
-            for js in sub_js:
-                if not COMMON_LIBS.search(js): js_urls.add(js)
-            for s in re.findall(r'<script[^>]*>([\s\S]*?)</script>', page, re.I):
-                if s.strip():
-                    all_apis.update(extract_apis(s))
-                    js_urls.update(extract_module_urls_from_content(s, link))
-                    path_prefixes.update(extract_prefixes_from_content(s))
-                    merge_param_profiles(param_profile, extract_param_profile(s))
-        if js_limit > 0:
-            remaining = max(0, js_limit - len(downloaded_js))
-            if remaining > 0:
-                harvest_js(js_urls, remaining)
-        else:
-            harvest_js(js_urls, 0)
+        js_graph = build_js_graph(
+            page_url=page_url,
+            html=html,
+            fetch_text=lambda resource_url, max_size=500_000: http_get(resource_url, max_size=max_size, retries=0),
+            js_limit=js_limit,
+            extract_js_from_html=extract_js_from_html,
+            extract_links_from_html=extract_links_from_html,
+            extract_apis=extract_apis,
+            extract_module_urls_from_content=extract_module_urls_from_content,
+            extract_prefixes_from_content=extract_prefixes_from_content,
+            extract_param_profile=extract_param_profile,
+            empty_param_profile=empty_param_profile,
+            merge_param_profiles=merge_param_profiles,
+            common_libs=COMMON_LIBS,
+            valid_sensitive_value=valid_sensitive_value,
+            vue_instance_re=VUE_INSTANCE_RE,
+            vue_router_re=VUE_ROUTER_RE,
+            react_route_re=REACT_ROUTE_RE,
+        )
+        all_apis.update(js_graph.api_paths())
+        all_apis.update(js_graph.sensitive)
+        path_prefixes.update(js_graph.prefixes)
+        merge_param_profiles(param_profile, js_graph.param_profile)
         # 将参数画像提取到的URL补充进API集合
         for extra_api in param_profile.get("_apis_from_params", set()):
             if extra_api.startswith("/"):
@@ -2199,13 +2144,13 @@ def main():
         clean = sorted((a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))), key=api_priority)
         sensitive = [a for a in all_apis if a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))]
         if not clean: return None
-        app_js_count = sum(1 for js in js_urls if not COMMON_LIBS.search(js))
         return {
             "base":base,"title":title,"apis":clean,"sensitive":sensitive,
-            "js_count":len(successful_js),
-            "js_discovered":len(js_urls),
-            "js_app_candidates":app_js_count,
-            "js_attempted":len(downloaded_js),
+            "js_count":js_graph.stats.get("js_count", 0),
+            "js_discovered":js_graph.stats.get("js_discovered", 0),
+            "js_app_candidates":js_graph.stats.get("js_app_candidates", 0),
+            "js_attempted":js_graph.stats.get("js_attempted", 0),
+            "js_graph_edges":js_graph.stats.get("edges", 0),
             "param_profile":param_profile,
         }
 
@@ -2266,11 +2211,10 @@ def main():
     # Phase 3: 两阶段测试
     phase3_mode = "FULL绕过+全变体" if args.collect_all_variants else "FULL绕过+命中断路" if args.full_bypass else "FAST绕过+命中断路"
     print(f"\n[Phase 3] 未授权测试 ({phase3_mode})...")
-    flat_tasks, target_map = [], {}
+    target_map = {}
     for t in api_results:
         target_map[t["base"]] = t; t["_f"] = []
-        for api in phase3_seed_apis(t):
-            flat_tasks.append((t, api))
+    flat_tasks = phase3_seed_tasks(api_results)
     print(f"  3a/fast: {len(flat_tasks)} tasks on {len(target_map)} hosts")
     t_start = time.time()
     pool = ThreadPoolExecutor(max_workers=WORKERS*2)
@@ -2305,18 +2249,7 @@ def main():
         pool.shutdown(wait=False, cancel_futures=True)
     print(f"  3a/fast 耗时: {time.time()-t_start:.0f}s")
 
-    body_fast_tasks, seen_body_fast = [], set()
-    for t in api_results:
-        for api in t["apis"]:
-            clean_api = api.split("?")[0].rstrip("/")
-            if not clean_api or (t["base"], clean_api) in seen_body_fast:
-                continue
-            if not has_body_bound_params(t.get("param_profile"), clean_api):
-                continue
-            if not should_param_probe(clean_api, t.get("param_profile")):
-                continue
-            seen_body_fast.add((t["base"], clean_api))
-            body_fast_tasks.append((t, clean_api))
+    body_fast_tasks = bound_body_tasks(api_results, max_per_target=4)
     if body_fast_tasks:
         print(f"  3a/body-fast: {len(body_fast_tasks)} bound POST tasks")
         t_start = time.time()
@@ -2332,23 +2265,8 @@ def main():
         print(f"  3a/body-fast 耗时: {time.time()-t_start:.0f}s")
 
     if args.phase3a_param_rescue:
-        rescue_param_tasks, seen_param_rescue = [], set()
         max_rescue_apis = max(0, args.phase3a_param_rescue_max_apis)
-        for t in api_results:
-            added = 0
-            for api in t["apis"]:
-                clean_api = api.split("?")[0].rstrip("/")
-                if not clean_api or (t["base"], clean_api) in seen_param_rescue:
-                    continue
-                if not has_bound_params(t.get("param_profile"), clean_api):
-                    continue
-                if not should_param_probe(clean_api, t.get("param_profile")):
-                    continue
-                seen_param_rescue.add((t["base"], clean_api))
-                rescue_param_tasks.append((t, clean_api))
-                added += 1
-                if max_rescue_apis and added >= max_rescue_apis:
-                    break
+        rescue_param_tasks = bound_param_tasks(api_results, max_per_target=max_rescue_apis or 4)
         if rescue_param_tasks:
             print(f"  3a/param-rescue: {len(rescue_param_tasks)} bound-param tasks")
             t_start = time.time()
@@ -2373,12 +2291,7 @@ def main():
             candidates.append(t)
     if not args.disable_rescue_baseline:
         candidate_bases = {t["base"] for t in candidates}
-        rescue_tasks = []
-        for t in api_results:
-            if t["base"] in candidate_bases:
-                continue
-            for api in unique_apis(BASELINE_PATHS + static_priority_apis(t)):
-                rescue_tasks.append((t, api))
+        rescue_tasks = high_yield_probe_tasks(api_results, exclude_bases=candidate_bases)
         if rescue_tasks:
             rescue_bypass = FULL_BYPASS if args.full_bypass else FAST_BYPASS
             rescue_label = "FULL" if args.full_bypass else "FAST"
@@ -2414,14 +2327,7 @@ def main():
         ]
         print("  3b: 分层 deep test (baseline -> business -> file)")
         for layer_name, api_provider in layers:
-            layer_tasks, seen_tasks = [], set()
-            for t in candidates:
-                hit_paths = finding_endpoint_paths(t.get("findings", []), high_value_only=True) if not args.collect_all_variants else set()
-                for api in api_provider(t):
-                    clean_api = api.split("?")[0].rstrip("/")
-                    if clean_api and clean_api in hit_paths:
-                        continue
-                    add_task(layer_tasks, seen_tasks, t, api, layer_name)
+            layer_tasks = layer_tasks_for_candidates(candidates, api_provider, layer_name, collect_all=args.collect_all_variants)
             if not layer_tasks:
                 continue
             print(f"  3b/{layer_name}: {len(layer_tasks)} tasks")

@@ -34,6 +34,26 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
 
+        targets_json = write(
+            tmp / "targets.json",
+            json.dumps([{"url": "https://a.example", "title": "A", "score": 7}, "b.example"]),
+        )
+        assert scanner.load_targets(targets_json, "targets") == [
+            ("https://a.example", "A", 7),
+            ("b.example", "", 0),
+        ]
+
+        targets_wrapped = write(tmp / "targets_wrapped.json", json.dumps({"targets": [{"url": "https://wrapped.example"}]}))
+        assert scanner.load_targets(targets_wrapped, "targets") == [
+            ("https://wrapped.example", "", 0),
+        ]
+
+        targets_txt = write(tmp / "targets.txt", "# comment\nexample.com\nhttps://site.test/path title ignored\n")
+        assert scanner.load_targets(targets_txt, "targets") == [
+            ("example.com", "", 0),
+            ("https://site.test/path", "", 0),
+        ]
+
         masscan_ol = write(tmp / "masscan.lst", "open tcp 8443 192.0.2.10\nopen tcp 8080 192.0.2.11\n")
         assert scanner.load_targets(masscan_ol, "masscan") == [
             ("192.0.2.10:8443", "masscan", 0),

@@ -9,6 +9,7 @@ import importlib.util
 import os
 import re
 import sys
+from urllib.parse import urljoin
 
 try:
     from pipeline.types import APIEndpoint, JSAsset, JSGraphEdge, JSGraphResult
@@ -407,6 +408,72 @@ def _request_dataflow(content, extract_apis, extract_param_profile, merge_param_
     return apis, param_profile
 
 
+
+def _parse_string_array(text):
+    values = []
+    for m in re.finditer(r'''["']([^"']+?\.js(?:\?[^"']*)?)["']''', text or "", re.I):
+        values.append(_decode_js_literal(m.group(1)))
+    return values
+
+
+def extract_lazy_chunk_urls(content, base_url):
+    """Extract common lazy JS chunk URLs from Webpack/Vite runtime snippets."""
+    urls = set()
+    if not content:
+        return urls
+
+    def add(spec):
+        spec = (spec or "").strip()
+        if not spec or spec.startswith(("data:", "javascript:", "#")):
+            return
+        path = spec.split("?", 1)[0].split("#", 1)[0]
+        if not (path.endswith(".js") or ".js" in path):
+            return
+        # Only runtime chunks are JS graph assets. API-like /prefix/download/foo.js
+        # URLs should remain API/file candidates, not JS modules.
+        if path.startswith("/") and not re.search(r"(?:^|/)(?:static/js|assets|js|chunk)[^/]*/", path, re.I):
+            if re.search(r"/(?:api|prod-api|dev-api|gateway|download|file|export|preview|upload|attach|attachment)/", path, re.I):
+                return
+        urls.add(urljoin(base_url, spec))
+
+    for pat in [
+        re.compile(r'''import\s*\(\s*["']([^"']+?\.js(?:\?[^"']*)?)["']\s*\)''', re.I),
+        re.compile(r'''["']([^"']*?(?:static/js|assets|js)/[^"']+?\.js(?:\?[^"']*)?)["']''', re.I),
+    ]:
+        for m in pat.finditer(content):
+            add(m.group(1))
+
+    for m in re.finditer(r'''\{([^{}]{1,8000})\}\s*\[[^\]]{1,80}\]\s*\+\s*["']([^"']*?\.js)["']''', content, re.S):
+        suffix = _decode_js_literal(m.group(2))
+        for _key, val in re.findall(r'''["']?([A-Za-z0-9_$-]+)["']?\s*:\s*["']([^"']{1,240})["']''', m.group(1)):
+            add(val + suffix)
+
+    for m in re.finditer(r'''__webpack_require__\.u\s*=\s*(?:function\s*\([^)]*\)|\(?[^=()]+\)?\s*=>)\s*\{?\s*return\s+([\s\S]{1,9000}?);''', content):
+        expr = m.group(1)
+        for chunk in extract_lazy_chunk_urls(expr, base_url):
+            add(chunk)
+
+    arrays = []
+    for m in re.finditer(r'''(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*\[([^\]]{1,12000})\]''', content, re.S):
+        arr = _parse_string_array(m.group(1))
+        if arr:
+            arrays.append(arr)
+    for m in re.finditer(r'''__vite__mapDeps\s*\(\s*\[([^\]]{1,1000})\]\s*\)''', content):
+        indexes = []
+        for n in re.findall(r'''\d+''', m.group(1)):
+            try:
+                indexes.append(int(n))
+            except Exception:
+                pass
+        for arr in arrays:
+            for idx in indexes:
+                if 0 <= idx < len(arr):
+                    add(arr[idx])
+    for arr in arrays:
+        for spec in arr:
+            add(spec)
+    return urls
+
 def build_js_graph(
     *,
     page_url,
@@ -441,6 +508,7 @@ def build_js_graph(
     all_apis.update(html_apis)
 
     js_urls = set(extract_js_from_html(html, page_url))
+    lazy_chunk_urls = set()
     result.discovered_urls.update(js_urls)
     links = extract_links_from_html(html, page_url)
 
@@ -462,6 +530,12 @@ def build_js_graph(
             result.edges.append(JSGraphEdge(src=page_url, dst=module_url, type="inline-import"))
         js_urls.update(modules)
         result.discovered_urls.update(modules)
+        lazy_modules = extract_lazy_chunk_urls(script, page_url)
+        for module_url in sorted(lazy_modules):
+            lazy_chunk_urls.add(module_url)
+            js_urls.add(module_url)
+            result.discovered_urls.add(module_url)
+            result.edges.append(JSGraphEdge(src=page_url, dst=module_url, type="lazy-chunk"))
         result.prefixes.update(extract_prefixes_from_content(script))
         _merge_profile(result.param_profile, extract_param_profile(script), merge_param_profiles)
 
@@ -518,6 +592,15 @@ def build_js_graph(
                 js_urls.add(module_url)
                 result.discovered_urls.add(module_url)
                 result.edges.append(JSGraphEdge(src=js_url, dst=module_url, type="module-import"))
+                if module_url not in queued and module_url not in downloaded_js:
+                    queue.append(module_url)
+                    queued.add(module_url)
+            lazy_modules = extract_lazy_chunk_urls(content, final_url or js_url)
+            for module_url in sorted(lazy_modules):
+                lazy_chunk_urls.add(module_url)
+                js_urls.add(module_url)
+                result.discovered_urls.add(module_url)
+                result.edges.append(JSGraphEdge(src=js_url, dst=module_url, type="lazy-chunk"))
                 if module_url not in queued and module_url not in downloaded_js:
                     queue.append(module_url)
                     queued.add(module_url)
@@ -580,5 +663,8 @@ def build_js_graph(
         "edges": len(result.edges),
         "apis": len(result.apis),
         "skipped_common": len(result.skipped_common_urls),
+        "lazy_chunks_discovered": len(lazy_chunk_urls),
+        "lazy_chunks_attempted": len(lazy_chunk_urls & result.attempted_urls),
+        "lazy_chunks_downloaded": len(lazy_chunk_urls & result.successful_urls),
     }
     return result

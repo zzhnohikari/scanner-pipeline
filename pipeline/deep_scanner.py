@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse, urljoin, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from threading import Lock
 
 PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
 if PIPELINE_DIR not in sys.path:
@@ -17,6 +18,7 @@ if PIPELINE_DIR not in sys.path:
 try:
     import pipeline.input_tools as input_tools
     from pipeline.js_extractor import build_js_graph
+    from pipeline.classifier import classify_response
     from pipeline.http_utils import (
         decode_http_body as _decode_http_body,
         http_accept_encoding,
@@ -27,6 +29,7 @@ try:
 except ImportError:
     import input_tools
     from js_extractor import build_js_graph
+    from classifier import classify_response
     from http_utils import (
         decode_http_body as _decode_http_body,
         http_accept_encoding,
@@ -74,6 +77,10 @@ def build_parser():
     parser.add_argument('--js-max-download', type=int, default=0, help='每个目标最多下载的外链JS数量，0=全部下载')
     parser.add_argument('--phase3a-param-rescue', action='store_true', help='3a阶段对有绑定参数的高价值API做小流量参数补筛')
     parser.add_argument('--phase3a-param-rescue-max-apis', type=int, default=10, help='每个目标最多参与3a参数补筛的API数')
+    parser.add_argument('--min-delay-ms', type=int, default=0, help='Phase 3每主机请求最小间隔毫秒，0=不限制')
+    parser.add_argument('--max-rps-per-host', type=float, default=0.0, help='Phase 3每主机最大请求速率，0=不限制；与--min-delay-ms取更保守值')
+    parser.add_argument('--max-requests-per-host', type=int, default=0, help='Phase 3每主机最大请求数硬上限，0=不限制')
+    parser.add_argument('--unauth-matrix', action='store_true', help='dry-run时输出未授权/IDOR矩阵预览，不发送额外请求')
     return parser
 
 def parse_cli(argv=None):
@@ -89,6 +96,8 @@ log.setLevel(logging.DEBUG if args.debug else logging.WARNING)
 
 TCP_TIMEOUT = 1.5; HTTP_TIMEOUT = args.timeout; API_TIMEOUT = max(6, args.timeout//2)
 WORKERS = args.workers; SSL_RETRIES = 2; OUTDIR = args.outdir
+PHASE3_RATE_LOCK = Lock()
+PHASE3_RATE_STATE = {}
 PHASE2_INVENTORY_NAME = "phase2_inventory.jsonl"
 os.makedirs(OUTDIR, exist_ok=True)
 if args.fresh:
@@ -1010,7 +1019,7 @@ def phase3_seed_apis(t):
     apis = list(t.get("apis", []))
     seed = list(apis[:30]) + static_priority_apis({"apis": apis}) + BASELINE_PATHS
     seen, out = set(), []
-    for api in sorted(seed, key=api_priority):
+    for api in sorted(seed, key=lambda item: api_test_order(t, item)):
         clean = api.split("?")[0].rstrip("/")
         if not clean or clean in seen:
             continue
@@ -1048,6 +1057,10 @@ def drop_prefixed_duplicates(apis):
         duplicate = False
         for idx in range(1, min(3, len(parts))):
             suffix = "/" + "/".join(parts[idx:])
+            # Preserve concrete query-bearing URLs, especially JS-derived file
+            # downloads, because stripping them can remove required object IDs.
+            if is_file_endpoint(api):
+                continue
             if suffix in paths and api_priority(suffix) <= api_priority(clean):
                 duplicate = True
                 break
@@ -1060,13 +1073,13 @@ def business_layer_apis(t):
     apis = [api for api in all_apis[:80] if not is_file_endpoint(api)]
     bound = [api for api in all_apis if has_body_bound_params(t.get("param_profile"), api)]
     priority = static_priority_apis(t, limit=30)
-    return unique_apis_keep_order(bound + priority + apis)
+    return unique_apis_keep_order(bound + priority + sorted(apis, key=lambda api: api_test_order(t, api)))
 
 def file_layer_apis(t):
     all_apis = drop_prefixed_duplicates(t["apis"])
     apis = [api for api in all_apis[:80] if is_file_endpoint(api)]
     bound_files = [api for api in all_apis if is_file_endpoint(api) and (has_body_bound_params(t.get("param_profile"), api) or should_param_probe(api, t.get("param_profile")))]
-    return unique_apis(apis + bound_files)
+    return unique_apis(sorted(apis + bound_files, key=lambda api: api_test_order(t, api)))
 
 def target_priority(t):
     apis = t.get("apis") or []
@@ -1074,8 +1087,9 @@ def target_priority(t):
     graph_bonus = min(int(t.get("js_graph_edges") or 0), 200)
     js_bonus = min(int(t.get("js_count") or 0), 80)
     param_bonus = min(len((t.get("param_profile") or {}).get("api_params", {}) or {}), 80)
+    confidence_bonus = int(max([api_confidence_for(t, api) for api in apis] or [0.0]) * 30)
     fallback_penalty = 25 if t.get("fallback") == "empty_http_response" else 0
-    return (best_api - graph_bonus - js_bonus - param_bonus + fallback_penalty, t.get("base", ""))
+    return (best_api - graph_bonus - js_bonus - param_bonus - confidence_bonus + fallback_penalty, t.get("base", ""))
 
 def target_host(t):
     host = urlparse(t.get("base", "")).hostname or t.get("base", "")
@@ -1083,6 +1097,51 @@ def target_host(t):
 
 def api_score_value(api):
     return -api_priority(api)[0]
+
+API_CONFIDENCE_TIERS = {
+    "swagger": 0.95,
+    "openapi": 0.95,
+    "param_binding": 0.85,
+    "js-graph": 0.80,
+    "js_literal": 0.75,
+    "business_pattern": 0.55,
+    "baseline": 0.35,
+}
+
+def add_api_meta(meta, api, source, confidence=None):
+    if not api or api.startswith(("SENSITIVE:", "INTERNAL_IP:", "JDBC:")):
+        return
+    clean = api.split("#", 1)[0].rstrip("/") or api
+    conf = float(confidence if confidence is not None else API_CONFIDENCE_TIERS.get(source, 0.70))
+    item = meta.setdefault(clean, {"confidence": conf, "sources": []})
+    item["confidence"] = max(float(item.get("confidence") or 0.0), conf)
+    if source and source not in item["sources"]:
+        item["sources"].append(source)
+
+def infer_api_meta(meta, api):
+    clean = api.split("#", 1)[0].rstrip("/") or api
+    if clean in meta:
+        return
+    lowered = clean.lower()
+    if any(x in lowered for x in ("swagger", "api-docs", "openapi")):
+        add_api_meta(meta, clean, "openapi")
+    elif clean in BASELINE_PATHS or any(clean.endswith(p) for p in BASELINE_PATHS if p.startswith("/")):
+        add_api_meta(meta, clean, "baseline")
+    elif api_score_value(clean) >= 70:
+        add_api_meta(meta, clean, "business_pattern")
+    else:
+        add_api_meta(meta, clean, "baseline")
+
+def api_confidence_for(t, api):
+    clean = api.split("#", 1)[0].rstrip("/") or api
+    meta = (t.get("api_meta") or {}).get(clean) or {}
+    try:
+        return float(meta.get("confidence") or 0.70)
+    except Exception:
+        return 0.70
+
+def api_test_order(t, api):
+    return (-api_confidence_for(t, api), api_priority(api))
 
 def ordered_targets_for_phase3(items):
     groups = {}
@@ -1196,9 +1255,15 @@ def normalize_extracted_api(path):
         return ""
     if path.startswith(("http:", "https:", "//")):
         return ""
+    query = ""
+    if "?" in path:
+        path, query = path.split("?", 1)
+        query = query.split("#", 1)[0]
+    else:
+        path = path.split("#", 1)[0]
     if not path.startswith("/"):
         path = "/" + path
-    path = path.split("?")[0].split("#")[0].rstrip("/")
+    path = path.rstrip("/")
     if not (2 < len(path) < 250):
         return ""
     if "\ufffd" in path or re.search(r"[\x00-\x1f\x7f\s]", path):
@@ -1209,6 +1274,13 @@ def normalize_extracted_api(path):
         return ""
     if os.path.splitext(path)[1].lower() in ('.js','.mjs','.ts','.tsx','.jsx','.vue','.css','.png','.jpg','.gif','.svg','.ico','.woff','.woff2','.ttf','.eot','.map','.json','.xml','.html','.pdf'):
         return ""
+    if query:
+        safe_parts = []
+        for part in query.split("&")[:8]:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_.-]{0,40}=[A-Za-z0-9_.:@%+,-]{0,160}$", part):
+                safe_parts.append(part)
+        if safe_parts:
+            return path + "?" + "&".join(safe_parts)
     return path
 
 def valid_sensitive_value(value):
@@ -1265,12 +1337,20 @@ def extract_concatenated_apis(content):
                 apis.add(path)
     return apis
 
+def _add_api_with_query_base(apis, path):
+    if not path:
+        return
+    apis.add(path)
+    if "?" in path:
+        base = path.split("?", 1)[0].rstrip("/")
+        if base:
+            apis.add(base)
+
 def extract_apis(js_content):
     apis = set()
     for m in LINKFINDER_RE.finditer(js_content):
         path = normalize_extracted_api(m.group(0))
-        if path:
-            apis.add(path)
+        _add_api_with_query_base(apis, path)
     for m in WEBPACK_CHUNK_RE.finditer(js_content):
         apis.add(m.group(0)[:200])
     for pat in [
@@ -1281,9 +1361,9 @@ def extract_apis(js_content):
     ]:
         for m in pat.finditer(js_content):
             path = normalize_extracted_api(m.group(1))
-            if path:
-                apis.add(path)
-    apis.update(extract_concatenated_apis(js_content))
+            _add_api_with_query_base(apis, path)
+    for path in extract_concatenated_apis(js_content):
+        _add_api_with_query_base(apis, path)
     return apis
 
 def is_module_asset_path(href):
@@ -1598,6 +1678,7 @@ def check_response(body, url, method, test_name, status_code=None):
     parsed = None
     try: parsed = json.loads(body)
     except: pass
+    classifier_summary = classify_response(status_code or 0, body, {})
     if parsed and isinstance(parsed, dict):
         code_val = next((parsed[k] for k in ("code","statusCode","status") if k in parsed and parsed[k] is not None), "")
         code = str(code_val)
@@ -1628,6 +1709,11 @@ def check_response(body, url, method, test_name, status_code=None):
             success_with_payload = False
         if has_data or success_with_payload or attack_path_ok:
             f = {"url":url,"method":method,"test":test_name,"code":code,"msg":msg[:200]}
+            f["classifier_verdict"] = classifier_summary.get("verdict")
+            f["classifier_confidence"] = classifier_summary.get("confidence")
+            f["classifier_reasons"] = classifier_summary.get("reasons", [])
+            f["sensitive_fields"] = classifier_summary.get("sensitive_fields", [])
+            f["data_signals"] = classifier_summary.get("data_signals", {})
             if isinstance(data_source, list):
                 f["data_count"]=len(data_source)
                 if data_source and isinstance(data_source[0], dict): f["data_keys"] = json_data_keys(data_source)
@@ -1642,6 +1728,11 @@ def check_response(body, url, method, test_name, status_code=None):
             return f
     elif parsed and isinstance(parsed, list) and len(parsed)>0:
         f = {"url":url,"method":method,"test":test_name,"data_count":len(parsed),"risk":"MEDIUM","raw":body[:500]}
+        f["classifier_verdict"] = classifier_summary.get("verdict")
+        f["classifier_confidence"] = classifier_summary.get("confidence")
+        f["classifier_reasons"] = classifier_summary.get("reasons", [])
+        f["sensitive_fields"] = classifier_summary.get("sensitive_fields", [])
+        f["data_signals"] = classifier_summary.get("data_signals", {})
         if isinstance(parsed[0], dict): f["data_keys"] = list(parsed[0].keys())[:15]; f["risk"] = risk_level(f)
         return f
     elif attack_path_ok:
@@ -1673,6 +1764,40 @@ def is_auth_failure_json(parsed):
         return False
     return walk(parsed)
 
+
+def phase3_host_key(url):
+    p = urlparse(url)
+    return p.netloc or p.path.split("/", 1)[0]
+
+def phase3_rate_delay_seconds():
+    delays = []
+    if getattr(args, "min_delay_ms", 0) and args.min_delay_ms > 0:
+        delays.append(args.min_delay_ms / 1000.0)
+    if getattr(args, "max_rps_per_host", 0.0) and args.max_rps_per_host > 0:
+        delays.append(1.0 / float(args.max_rps_per_host))
+    return max(delays) if delays else 0.0
+
+def acquire_phase3_request_slot(url):
+    """Best-effort per-host Phase 3 limiter. Returns (allowed, reason)."""
+    host = phase3_host_key(url)
+    delay = phase3_rate_delay_seconds()
+    while True:
+        sleep_for = 0.0
+        with PHASE3_RATE_LOCK:
+            state = PHASE3_RATE_STATE.setdefault(host, {"count": 0, "last": 0.0})
+            cap = int(getattr(args, "max_requests_per_host", 0) or 0)
+            if cap > 0 and state["count"] >= cap:
+                return False, "max_requests_per_host"
+            now = time.time()
+            if delay > 0 and state["last"] and now - state["last"] < delay:
+                sleep_for = delay - (now - state["last"])
+            else:
+                state["count"] += 1
+                state["last"] = now
+                return True, ""
+        if sleep_for > 0:
+            time.sleep(min(sleep_for, delay or sleep_for))
+
 # ===== API 测试（双模式） =====
 def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=None, allow_param_probe=True):
     clean = path.split("?")[0].rstrip("/")
@@ -1689,6 +1814,10 @@ def test_api(base_url, path, bypass_tests, short_circuit=True, param_profile=Non
                 h = {"User-Agent":"Mozilla/5.0","Accept":"application/json","Accept-Encoding":http_accept_encoding()}
                 h.update(headers)
                 if data and ct: h["Content-Type"] = ct
+                allowed, limit_reason = acquire_phase3_request_slot(url)
+                if not allowed:
+                    log.debug(f"Phase3 request skipped for {url}: {limit_reason}")
+                    continue
                 req = Request(url, data=data, headers=h, method=method)
                 resp = urlopen(req, timeout=API_TIMEOUT, context=ssl_ctx)
                 _, body_bytes, body = read_http_response(resp)
@@ -1879,6 +2008,38 @@ def report_stats(vulnerable):
         "js_intel": js_intel_count,
     }
 
+
+def build_unauth_matrix_preview(base, apis, param_profile=None, limit=20):
+    """Build a no-network unauth/IDOR planning matrix for high-value endpoints."""
+    profile = param_profile or {}
+    preview = []
+    for api in sorted(unique_apis(apis or []), key=api_priority)[:limit]:
+        clean = api.split("?", 1)[0].rstrip("/") or api
+        methods = ["GET"]
+        if has_body_bound_params(profile, clean) or any(w in clean.lower() for w in ("save", "update", "create", "query", "search")):
+            methods.append("POST")
+        variants = []
+        q_names = sorted(bound_param_names_by_source(profile, clean, "query") or bound_param_names(profile, clean))[:8]
+        if q_names:
+            variants.append({"style": "query", "method": "GET", "param_names": q_names})
+        else:
+            variants.append({"style": "query", "method": "GET", "param_names": []})
+        json_names = sorted(bound_param_names_by_source(profile, clean, "json"))[:8]
+        form_names = sorted(bound_param_names_by_source(profile, clean, "form"))[:8]
+        if json_names:
+            variants.append({"style": "json", "method": "POST", "param_names": json_names})
+        if form_names:
+            variants.append({"style": "form", "method": "POST", "param_names": form_names})
+        preview.append({
+            "path": clean,
+            "priority": -api_priority(clean)[0],
+            "methods": methods,
+            "variants": variants,
+            "active_probe": False,
+            "reason": "dry_run_preview_only",
+        })
+    return preview
+
 def target_filename(base):
     return re.sub(r'[^a-zA-Z0-9]', '_', base) + ".json"
 
@@ -1913,11 +2074,22 @@ def phase2_inventory_record(t, api_limit=None, param_name_limit=None, seed_limit
         "title": t.get("title", ""),
         "api_count": len(t.get("apis", [])),
         "apis": list(t.get("apis", [])) if api_limit is None else list(t.get("apis", []))[:api_limit],
+        "api_confidence": {
+            api: round(api_confidence_for(t, api), 2)
+            for api in (list(t.get("apis", [])) if api_limit is None else list(t.get("apis", []))[:api_limit])
+        },
+        "api_sources": {
+            api: ((t.get("api_meta") or {}).get(api.split("#", 1)[0].rstrip("/") or api, {}).get("sources") or [])
+            for api in (list(t.get("apis", [])) if api_limit is None else list(t.get("apis", []))[:api_limit])
+        },
         "js_discovered": t.get("js_discovered", t.get("js_count", 0)),
         "js_app_candidates": t.get("js_app_candidates", t.get("js_count", 0)),
         "js_attempted": t.get("js_attempted", t.get("js_count", 0)),
         "js_count": t.get("js_count", 0),
         "js_graph_edges": t.get("js_graph_edges", 0),
+        "lazy_chunks_discovered": t.get("lazy_chunks_discovered", 0),
+        "lazy_chunks_attempted": t.get("lazy_chunks_attempted", 0),
+        "lazy_chunks_downloaded": t.get("lazy_chunks_downloaded", 0),
         "js_intel": sorted(t.get("sensitive") or t.get("js_intel") or []),
         "fallback": t.get("fallback", ""),
         "param_name_count": len(names),
@@ -1927,6 +2099,8 @@ def phase2_inventory_record(t, api_limit=None, param_name_limit=None, seed_limit
         "file_seed_count": len(file_seeds),
         "file_seed_values": file_seeds if file_seed_limit is None else file_seeds[:file_seed_limit],
     }
+    if getattr(args, "unauth_matrix", False):
+        record["unauth_matrix_preview"] = build_unauth_matrix_preview(t.get("base", ""), t.get("apis", []), t.get("param_profile"), limit=20)
     if include_param_profile:
         record["param_profile"] = profile
     return record
@@ -1976,7 +2150,10 @@ def baseline_api_result(url):
     page_url = url if url.endswith("/") else url + "/"
     prefixes = path_prefixes_from_url(page_url)
     apis = expand_with_prefixes(set(BASELINE_PATHS), prefixes)
-    return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"sensitive":[],"js_count":0,"param_profile":empty_param_profile(),"fallback":"phase2_timeout"}
+    api_meta = {}
+    for api in apis:
+        add_api_meta(api_meta, api, "baseline")
+    return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"api_meta":api_meta,"sensitive":[],"js_count":0,"param_profile":empty_param_profile(),"fallback":"phase2_timeout"}
 
 def add_task(tasks, seen, t, api, layer):
     key = (t["base"], api, layer)
@@ -2084,6 +2261,8 @@ def main():
     print(f"\n[Phase 2] JS爬取+API提取...")
     bypass_used = FULL_BYPASS if args.full_bypass else FAST_BYPASS
     print(f"  绕过: {'FULL(6种)' if args.full_bypass else 'FAST(2种,短路)'} | dry-run={args.dry_run} | file-hunter={not args.disable_file_hunter} | file-baseline={args.enable_file_baseline and not args.disable_file_hunter} | param-harvest={not args.disable_param_harvest}")
+    if args.min_delay_ms or args.max_rps_per_host or args.max_requests_per_host:
+        print(f"  Phase3 safety: min_delay_ms={args.min_delay_ms} max_rps_per_host={args.max_rps_per_host} max_requests_per_host={args.max_requests_per_host}")
 
     api_results, done = [], 0
     def crawl(url):
@@ -2094,12 +2273,17 @@ def main():
         status, final_url, html, ct = http_get(page_url, retries=0)
         status, final_url, html, ct = refresh_sparse_phase2_page(page_url, status, final_url, html, ct)
         swagger_apis = collect_swagger_apis(base)
+        api_meta = {}
+        for api in swagger_apis:
+            add_api_meta(api_meta, api, "swagger")
         if status is None:
             return None
         if not html:
             apis = set(BASELINE_PATHS) | swagger_apis
             apis = expand_with_prefixes(apis, path_prefixes)
-            return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"sensitive":[],"js_count":0,"param_profile":param_profile,"fallback":"empty_http_response"}
+            for api in apis:
+                infer_api_meta(api_meta, api)
+            return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"api_meta":api_meta,"sensitive":[],"js_count":0,"param_profile":param_profile,"fallback":"empty_http_response"}
         merge_param_profiles(param_profile, extract_param_profile(html))
         title = ""
         m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
@@ -2130,6 +2314,8 @@ def main():
             react_route_re=REACT_ROUTE_RE,
         )
         all_apis.update(js_graph.api_paths())
+        for endpoint in js_graph.apis:
+            add_api_meta(api_meta, endpoint.path, endpoint.source, endpoint.confidence)
         all_apis.update(js_graph.sensitive)
         path_prefixes.update(js_graph.prefixes)
         merge_param_profiles(param_profile, js_graph.param_profile)
@@ -2137,20 +2323,28 @@ def main():
         for extra_api in param_profile.get("_apis_from_params", set()):
             if extra_api.startswith("/"):
                 all_apis.add(extra_api)
+                add_api_meta(api_meta, extra_api, "param_binding")
         all_apis.update(swagger_apis)
         all_apis = expand_paths(base, all_apis)
+        for api in BASELINE_PATHS:
+            add_api_meta(api_meta, api, "baseline")
         all_apis.update(BASELINE_PATHS)
         all_apis = expand_with_prefixes(all_apis, path_prefixes)
-        clean = sorted((a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))), key=api_priority)
+        clean = sorted((a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))), key=lambda api: api_test_order({"api_meta": api_meta}, api))
+        for api in clean:
+            infer_api_meta(api_meta, api)
         sensitive = [a for a in all_apis if a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))]
         if not clean: return None
         return {
-            "base":base,"title":title,"apis":clean,"sensitive":sensitive,
+            "base":base,"title":title,"apis":clean,"api_meta":{api: api_meta.get(api.split("#", 1)[0].rstrip("/") or api, {}) for api in clean},"sensitive":sensitive,
             "js_count":js_graph.stats.get("js_count", 0),
             "js_discovered":js_graph.stats.get("js_discovered", 0),
             "js_app_candidates":js_graph.stats.get("js_app_candidates", 0),
             "js_attempted":js_graph.stats.get("js_attempted", 0),
             "js_graph_edges":js_graph.stats.get("edges", 0),
+            "lazy_chunks_discovered": js_graph.stats.get("lazy_chunks_discovered", 0),
+            "lazy_chunks_attempted": js_graph.stats.get("lazy_chunks_attempted", 0),
+            "lazy_chunks_downloaded": js_graph.stats.get("lazy_chunks_downloaded", 0),
             "param_profile":param_profile,
         }
 

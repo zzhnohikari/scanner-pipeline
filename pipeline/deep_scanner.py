@@ -81,6 +81,8 @@ def build_parser():
     parser.add_argument('--max-rps-per-host', type=float, default=0.0, help='Phase 3每主机最大请求速率，0=不限制；与--min-delay-ms取更保守值')
     parser.add_argument('--max-requests-per-host', type=int, default=0, help='Phase 3每主机最大请求数硬上限，0=不限制')
     parser.add_argument('--unauth-matrix', action='store_true', help='dry-run时输出未授权/IDOR矩阵预览，不发送额外请求')
+    parser.add_argument('--redact-raw-findings', action='store_true', help='写出checkpoint/report前移除finding中的raw原始响应字段，避免敏感正文落盘')
+    parser.add_argument('--phase12-workers', type=int, default=0, help='单独限制Phase 1/2线程池大小，0=沿用当前--workers派生行为；Phase 3仍使用--workers')
     return parser
 
 def parse_cli(argv=None):
@@ -95,7 +97,8 @@ log.addHandler(logging.StreamHandler())
 log.setLevel(logging.DEBUG if args.debug else logging.WARNING)
 
 TCP_TIMEOUT = 1.5; HTTP_TIMEOUT = args.timeout; API_TIMEOUT = max(6, args.timeout//2)
-WORKERS = args.workers; SSL_RETRIES = 2; OUTDIR = args.outdir
+WORKERS = args.workers; PHASE12_WORKERS = max(1, int(args.phase12_workers)) if int(getattr(args, 'phase12_workers', 0) or 0) > 0 else 0
+SSL_RETRIES = 2; OUTDIR = args.outdir
 PHASE3_RATE_LOCK = Lock()
 PHASE3_RATE_STATE = {}
 PHASE2_INVENTORY_NAME = "phase2_inventory.jsonl"
@@ -2105,6 +2108,26 @@ def phase2_inventory_record(t, api_limit=None, param_name_limit=None, seed_limit
         record["param_profile"] = profile
     return record
 
+
+RAW_FIELD_KEYS = {"raw", "raw_body", "body_raw", "response_raw", "raw_response", "request_raw", "raw_request"}
+
+def redact_raw_finding_fields(obj):
+    """Return a copy with raw response/request payload fields removed recursively."""
+    if isinstance(obj, dict):
+        return {
+            key: redact_raw_finding_fields(value)
+            for key, value in obj.items()
+            if str(key).lower() not in RAW_FIELD_KEYS
+        }
+    if isinstance(obj, list):
+        return [redact_raw_finding_fields(item) for item in obj]
+    return obj
+
+def maybe_redact_raw_findings(obj):
+    if getattr(args, "redact_raw_findings", False):
+        return redact_raw_finding_fields(obj)
+    return obj
+
 def write_phase2_inventory(t):
     with open(os.path.join(OUTDIR, PHASE2_INVENTORY_NAME), "a") as f:
         json.dump(phase2_inventory_record(t), f, ensure_ascii=False)
@@ -2125,6 +2148,7 @@ def write_target_result(t):
         out["sensitive"] = sorted(out.get("sensitive") or [])
     if "js_intel" in out:
         out["js_intel"] = sorted(out.get("js_intel") or [])
+    out = maybe_redact_raw_findings(out)
     with open(os.path.join(OUTDIR, target_filename(t["base"])), "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=2, default=str)
 
@@ -2138,6 +2162,7 @@ def load_checkpoint_results():
             with open(path) as f:
                 item = json.load(f)
             if item.get("base") and item.get("findings"):
+                item = maybe_redact_raw_findings(item)
                 item["finding_count"] = len(item.get("findings", []))
                 item["raw_event_count"] = sum(int(fi.get("variant_count") or 1) for fi in item.get("findings", []))
                 items.append(item)
@@ -2240,7 +2265,7 @@ def main():
                         bases.append(base)
                 return bases
             return []
-        with ThreadPoolExecutor(max_workers=WORKERS*4) as pool:
+        with ThreadPoolExecutor(max_workers=PHASE12_WORKERS or WORKERS*4) as pool:
             futures = {pool.submit(probe, t[0]): t for t in targets}
             for f in as_completed(futures):
                 done += 1
@@ -2263,6 +2288,10 @@ def main():
     print(f"  绕过: {'FULL(6种)' if args.full_bypass else 'FAST(2种,短路)'} | dry-run={args.dry_run} | file-hunter={not args.disable_file_hunter} | file-baseline={args.enable_file_baseline and not args.disable_file_hunter} | param-harvest={not args.disable_param_harvest}")
     if args.min_delay_ms or args.max_rps_per_host or args.max_requests_per_host:
         print(f"  Phase3 safety: min_delay_ms={args.min_delay_ms} max_rps_per_host={args.max_rps_per_host} max_requests_per_host={args.max_requests_per_host}")
+    if PHASE12_WORKERS:
+        print(f"  Phase1/2 workers capped: {PHASE12_WORKERS}")
+    if args.redact_raw_findings:
+        print("  Finding raw redaction: ON")
 
     api_results, done = [], 0
     def crawl(url):
@@ -2348,7 +2377,7 @@ def main():
             "param_profile":param_profile,
         }
 
-    pool = ThreadPoolExecutor(max_workers=WORKERS)
+    pool = ThreadPoolExecutor(max_workers=PHASE12_WORKERS or WORKERS)
     try:
         futures = {pool.submit(crawl, u): u for u in live}
         pending = set(futures)
@@ -2576,6 +2605,7 @@ def main():
             "aggregated_findings":v.get("finding_count", len(v.get("findings", []))),
             "findings":v.get("findings",[]),
         })
+    report = maybe_redact_raw_findings(report)
     with open(os.path.join(OUTDIR,"report.json"),"w") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=str)
 

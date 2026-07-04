@@ -181,12 +181,84 @@ def test_dry_run_matrix_and_lazy_stats():
         server.server_close()
 
 
+
+class RedactHandler(RateHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path.startswith("/?"):
+            return self.send_body('<script src="/app.js"></script>')
+        if self.path == "/app.js":
+            return self.send_body('fetch("/api/pii");', "application/javascript")
+        if self.path.startswith("/api/pii"):
+            return self.send_body(json.dumps({"code": 0, "data": [{"phone": "PII_MARKER_8675309", "address": "Redact Lab"}]}), "application/json")
+        return self.send_body("not found", status=404)
+
+
+def run_redact_scan(redact):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RedactHandler)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        tmp_obj = tempfile.TemporaryDirectory()
+        tmp = Path(tmp_obj.name)
+        target_file = tmp / "targets.json"
+        outdir = tmp / "out"
+        target_file.write_text(json.dumps([{"url": base, "title": "redact", "score": 100}]), encoding="utf-8")
+        cmd = [
+            sys.executable, str(SCANNER), "--input", str(target_file), "--outdir", str(outdir),
+            "--workers", "4", "--timeout", "3", "--no-proxy", "--fresh",
+            "--phase3a-timeout", "40", "--phase3b-layer-timeout", "20", "--disable-rescue-baseline",
+            "--max-requests-per-host", "8", "--phase12-workers", "2",
+        ]
+        if redact:
+            cmd.append("--redact-raw-findings")
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
+        if proc.returncode != 0:
+            print(proc.stdout)
+            print(proc.stderr)
+            raise SystemExit(proc.returncode)
+        return tmp_obj, outdir
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_redact_raw_findings_removes_raw_and_pii_marker():
+    tmp_obj, outdir = run_redact_scan(redact=True)
+    try:
+        serialized = (outdir / "report.json").read_text(encoding="utf-8")
+        assert '"raw"' not in serialized, serialized[:1000]
+        assert "PII_MARKER_8675309" not in serialized, serialized[:1000]
+        checkpoints = [p for p in outdir.glob("*.json") if p.name not in {"report.json", "apis.json"}]
+        assert checkpoints, list(outdir.iterdir())
+        for path in checkpoints:
+            text = path.read_text(encoding="utf-8")
+            assert '"raw"' not in text, path
+            assert "PII_MARKER_8675309" not in text, path
+        report = json.loads(serialized)
+        finding = report["findings"][0]["findings"][0]
+        assert finding.get("classifier_verdict"), finding
+        assert finding.get("sensitive_fields") is not None, finding
+    finally:
+        tmp_obj.cleanup()
+
+
+def test_raw_findings_compatibility_default_keeps_raw():
+    tmp_obj, outdir = run_redact_scan(redact=False)
+    try:
+        serialized = (outdir / "report.json").read_text(encoding="utf-8")
+        assert '"raw"' in serialized, serialized[:1000]
+        assert "PII_MARKER_8675309" in serialized, serialized[:1000]
+    finally:
+        tmp_obj.cleanup()
+
 def main():
     test_classifier()
     test_lazy_chunk_extraction()
     test_matrix_builder()
     test_rate_limit_cap_and_delay()
     test_dry_run_matrix_and_lazy_stats()
+    test_redact_raw_findings_removes_raw_and_pii_marker()
+    test_raw_findings_compatibility_default_keeps_raw()
     print("V25 CLASSIFIER MATRIX LAZY CHUNKS RATE LIMIT PASS")
 
 

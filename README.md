@@ -69,7 +69,8 @@ python3 pipeline/deep_scanner.py --input targets.json --dry-run --unauth-matrix
 
 # 5b. 授权真实目标测试前建议加 Phase 3 安全限流
 python3 pipeline/deep_scanner.py --input targets.json --outdir results_safe \
-  --max-rps-per-host 1 --min-delay-ms 1000 --max-requests-per-host 80
+  --max-rps-per-host 1 --min-delay-ms 1000 --max-requests-per-host 80 \
+  --phase12-workers 4 --redact-raw-findings
 
 # 6. 大批 IP/CIDR：masscan 发现端口 + httpx 确认 HTTP
 python3 pipeline/deep_scanner.py \
@@ -133,6 +134,8 @@ python3 tests/v13_post_body_lab.py
 | `--min-delay-ms` | 0 | Phase 3 每主机请求最小间隔毫秒，0=不限制 |
 | `--max-rps-per-host` | 0 | Phase 3 每主机最大请求速率，0=不限制；与最小间隔取更保守值 |
 | `--max-requests-per-host` | 0 | Phase 3 每主机最大请求数硬上限，0=不限制 |
+| `--redact-raw-findings` | false | 写出 checkpoint/report 前移除 finding 内 `raw` 等原始响应字段，避免敏感正文落盘 |
+| `--phase12-workers` | 0 | 单独限制 Phase 1/2 线程池大小，0=沿用当前 `--workers` 派生行为；Phase 3 仍使用 `--workers` |
 | `--full-bypass` | false | 启用 FULL 绕过方法, 默认仍命中断路 |
 | `--collect-all-variants` | false | 命中后继续收集所有绕过/参数变体, 隐含 `--full-bypass`, 小批目标补证据用 |
 | `--debug` | false | 调试日志 |
@@ -421,7 +424,9 @@ name, fileName, key, objectKey, ossKey, resourceId
 
 ## 安全限流与响应分类
 
-真实授权目标测试前建议显式设置 Phase 3 限流：`--max-rps-per-host` 控制每主机请求速率，`--min-delay-ms` 控制每主机请求间隔，`--max-requests-per-host` 是每主机硬上限。当前实现是在 Phase 3 请求路径做进程内 per-host best-effort 限流；Phase 1/2 的存活确认与 JS 下载不受这些 Phase 3 参数限制。
+真实授权目标测试前建议显式设置 Phase 3 限流：`--max-rps-per-host` 控制每主机请求速率，`--min-delay-ms` 控制每主机请求间隔，`--max-requests-per-host` 是每主机硬上限。当前实现是在 Phase 3 请求路径做进程内 per-host best-effort 限流；Phase 1/2 的存活确认与 JS 下载不受这些 Phase 3 参数限制，但可用 `--phase12-workers` 单独压低 Phase 1/2 并发。
+
+主动验证或报告落盘前建议启用 `--redact-raw-findings`。该开关保持默认关闭以兼容旧测试/旧工作流；启用后会在写出每目标 checkpoint 与最终 report.json 前递归移除 findings 内 `raw`、`raw_body`、`raw_response` 等原始包字段，保留 classifier 的安全摘要字段。
 
 `pipeline/classifier.py` 提供 `classify_response(status, body, headers=None)`，用于输出未授权/API 响应摘要：`verdict`、`risk`、`confidence`、`reasons`、`sensitive_fields`、`data_signals`。分类器不会返回原始响应正文或正文片段，避免把敏感证据写入摘要。
 

@@ -4,7 +4,7 @@ v13: 文件专项 + HTML/JS静态参数画像 + URL/参数绑定 + POST body/for
 融合 JSFinder/Webpack_extract/VueCrack/Packer-Fuzzer 技术
 """
 
-import os, re, json, time, ssl, socket, argparse, logging, sys
+import os, re, json, time, ssl, socket, argparse, logging, sys, hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse, urljoin, urlencode
 from urllib.request import Request, urlopen
@@ -83,6 +83,12 @@ def build_parser():
     parser.add_argument('--unauth-matrix', action='store_true', help='dry-run时输出未授权/IDOR矩阵预览，不发送额外请求')
     parser.add_argument('--redact-raw-findings', action='store_true', help='写出checkpoint/report前移除finding中的raw原始响应字段，避免敏感正文落盘')
     parser.add_argument('--phase12-workers', type=int, default=0, help='单独限制Phase 1/2线程池大小，0=沿用当前--workers派生行为；Phase 3仍使用--workers')
+    parser.add_argument('--legacy-recovery', action='store_true', help='启用低置信 legacy baseline 恢复候选，默认关闭以避免膨胀')
+    parser.add_argument('--compare-inventory', default='', help='dry-run后与旧 apis.json/phase2_inventory.jsonl 做安全聚合差异报告')
+    parser.add_argument('--compare-output', default='', help='inventory diff 输出路径，默认写到 outdir/inventory_diff.json')
+    parser.add_argument('--include-samples', action='store_true', help='inventory diff 中包含少量路径样本；默认不输出具体host/path')
+    parser.add_argument('--validate-from-report', default='', help='从既有 report.json 中提取端点做保守聚焦复核')
+    parser.add_argument('--validate-plan-only', action='store_true', help='配合 --validate-from-report 只生成复核计划，不发请求')
     return parser
 
 def parse_cli(argv=None):
@@ -1109,7 +1115,45 @@ API_CONFIDENCE_TIERS = {
     "js_literal": 0.75,
     "business_pattern": 0.55,
     "baseline": 0.35,
+    "legacy_recovery": 0.30,
+    "legacy_baseline": 0.30,
 }
+
+
+LEGACY_RECOVERY_PATHS = [
+    # Swagger/OpenAPI/doc UIs and descriptors seen in older scanner output.
+    "/swagger-ui.html", "/swagger/index.html", "/swagger-resources", "/v2/api-docs", "/v3/api-docs",
+    "/api-docs", "/openapi.json", "/openapi.yaml", "/doc.html", "/docs", "/knife4j/doc.html",
+    # Common old-style action and file-ish candidates; intentionally small.
+    "/download.action", "/file/download.action", "/export.action",
+    "/api/file/download", "/api/common/download", "/api/attachment/download", "/api/export",
+]
+LEGACY_ALLOWED_DOT_EXTS = (".action", ".do", ".json", ".yaml", ".html")
+
+def is_safe_legacy_recovery_path(path):
+    path = normalize_extracted_api(path)
+    if not path:
+        return False
+    lowered = path.lower().split("?", 1)[0]
+    if any(ch in lowered for ch in ("{", "}", "[", "]", "\\")):
+        return False
+    # Exclude dot-path artifacts such as /foo.bar.baz unless it is a reviewed legacy extension.
+    basename = lowered.rsplit("/", 1)[-1]
+    if "." in basename and not basename.endswith(LEGACY_ALLOWED_DOT_EXTS):
+        return False
+    return lowered in {p.lower() for p in LEGACY_RECOVERY_PATHS}
+
+def legacy_recovery_candidates():
+    return [p for p in LEGACY_RECOVERY_PATHS if is_safe_legacy_recovery_path(p)]
+
+def mark_legacy_recovery_meta(meta, apis):
+    legacy = set(legacy_recovery_candidates())
+    for api in apis or []:
+        clean = str(api).split("#", 1)[0].rstrip("/") or str(api)
+        for candidate in legacy:
+            if clean == candidate or clean.endswith(candidate):
+                add_api_meta(meta, clean, "legacy_recovery", 0.30)
+                break
 
 def add_api_meta(meta, api, source, confidence=None):
     if not api or api.startswith(("SENSITIVE:", "INTERNAL_IP:", "JDBC:")):
@@ -2043,6 +2087,188 @@ def build_unauth_matrix_preview(base, apis, param_profile=None, limit=20):
         })
     return preview
 
+
+def _hash_text(value):
+    return hashlib.sha256(str(value or "").encode("utf-8", "ignore")).hexdigest()[:12]
+
+def _hash_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+def categorize_api_path(path, sources=None, confidence=0.0):
+    lowered = str(path or "").lower()
+    sources = set(sources or [])
+    if any(x in lowered for x in ("swagger", "api-docs", "openapi", "doc.html", "/docs", "knife4j")):
+        return "swagger_openapi_doc"
+    if is_file_endpoint(lowered) or lowered.endswith(LEGACY_ALLOWED_DOT_EXTS):
+        if any(w in lowered for w in ("download", "export", "file", "attach", "upload")):
+            return "file_or_action"
+    basename = lowered.rsplit("/", 1)[-1]
+    if "." in basename and not basename.endswith(LEGACY_ALLOWED_DOT_EXTS):
+        return "dot_path_artifact"
+    if "legacy_recovery" in sources or "legacy_baseline" in sources or confidence <= 0.35:
+        return "low_confidence"
+    if any(x in lowered for x in ("chunk", "static/js", "/assets/")):
+        return "lazy_or_static"
+    if api_score_value(lowered) >= 70:
+        return "high_priority"
+    return "other"
+
+def _iter_inventory_records(path):
+    with open(path, encoding="utf-8") as f:
+        text = f.read().strip()
+    if not text:
+        return []
+    records = []
+    if text[0] == "[":
+        records = json.loads(text)
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return [r for r in records if isinstance(r, dict)]
+
+def _inventory_api_map(records):
+    out = {}
+    for rec in records or []:
+        base = str(rec.get("base") or rec.get("url") or "")
+        api_conf = rec.get("api_confidence") or {}
+        api_sources = rec.get("api_sources") or {}
+        for api in rec.get("apis") or []:
+            clean = str(api).split("#", 1)[0].rstrip("/") or str(api)
+            out.setdefault(clean, {"bases": set(), "sources": set(), "confidence": 0.0})
+            out[clean]["bases"].add(base)
+            try:
+                out[clean]["confidence"] = max(out[clean]["confidence"], float(api_conf.get(api, api_conf.get(clean, 0.0)) or 0.0))
+            except Exception:
+                pass
+            for src in api_sources.get(api, api_sources.get(clean, [])) or []:
+                out[clean]["sources"].add(str(src))
+    return out
+
+def _category_counts(paths, meta_map):
+    counts = {}
+    for path in paths:
+        meta = meta_map.get(path, {})
+        cat = categorize_api_path(path, meta.get("sources"), meta.get("confidence", 0.0))
+        counts[cat] = counts.get(cat, 0) + 1
+    return dict(sorted(counts.items()))
+
+def compare_inventory_files(current_path, old_path, include_samples=False, sample_limit=10):
+    current = _inventory_api_map(_iter_inventory_records(current_path))
+    old = _inventory_api_map(_iter_inventory_records(old_path))
+    cur_paths, old_paths = set(current), set(old)
+    common = cur_paths & old_paths
+    old_only = old_paths - cur_paths
+    new_only = cur_paths - old_paths
+    report = {
+        "ok": True,
+        "safe_default": not include_samples,
+        "counts": {"current": len(cur_paths), "old": len(old_paths), "common": len(common), "old_only": len(old_only), "new_only": len(new_only)},
+        "old_only_categories": _category_counts(old_only, old),
+        "new_only_categories": _category_counts(new_only, current),
+        "coverage": {
+            "current_high_priority": sum(1 for p in cur_paths if api_score_value(p) >= 70),
+            "current_file": sum(1 for p in cur_paths if is_file_endpoint(p)),
+            "current_swagger_doc": sum(1 for p in cur_paths if categorize_api_path(p, current.get(p, {}).get("sources"), current.get(p, {}).get("confidence", 0.0)) == "swagger_openapi_doc"),
+            "current_legacy_low_confidence": sum(1 for p in cur_paths if "legacy_recovery" in current.get(p, {}).get("sources", set()) or current.get(p, {}).get("confidence", 1.0) <= 0.35),
+        },
+        "inputs": {"current_sha256_12": _hash_file(current_path), "old_sha256_12": _hash_file(old_path)},
+    }
+    if include_samples:
+        report["samples"] = {
+            "old_only": sorted(old_only)[:sample_limit],
+            "new_only": sorted(new_only)[:sample_limit],
+        }
+    return report
+
+def write_inventory_diff(current_path, old_path, output_path, include_samples=False):
+    report = compare_inventory_files(current_path, old_path, include_samples=include_samples)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return report
+
+def _validate_safety_args():
+    # Coerce to conservative caps; never loosen user-supplied safer values.
+    args.redact_raw_findings = True
+    if not args.max_rps_per_host or args.max_rps_per_host > 0.5:
+        args.max_rps_per_host = 0.5
+    if not args.min_delay_ms or args.min_delay_ms < 2000:
+        args.min_delay_ms = 2000
+    if not args.max_requests_per_host or args.max_requests_per_host > 40:
+        args.max_requests_per_host = 40
+    if not PHASE12_WORKERS or PHASE12_WORKERS > 4:
+        globals()["PHASE12_WORKERS"] = 2
+    if args.workers > 4:
+        args.workers = 4
+        globals()["WORKERS"] = 4
+
+def build_validate_plan_from_report(report_path, max_items=40):
+    with open(report_path, encoding="utf-8") as f:
+        report = json.load(f)
+    tasks = []
+    for host in report.get("findings") or []:
+        base = host.get("url") or host.get("base") or ""
+        for fi in host.get("findings") or []:
+            urls = list(fi.get("sample_urls") or [])
+            if fi.get("url"):
+                urls.insert(0, fi.get("url"))
+            if not urls:
+                continue
+            for u in urls[:3]:
+                p = urlparse(u)
+                if not p.scheme or not p.netloc:
+                    continue
+                tasks.append({"base": f"{p.scheme}://{p.netloc}", "path": (p.path or "/") + (("?" + p.query) if p.query else ""), "source_risk": fi.get("risk", ""), "attack_path_intel": bool(fi.get("attack_path_intel"))})
+                break
+        if len(tasks) >= max_items:
+            break
+    seen, out = set(), []
+    for task in tasks:
+        key = (task["base"], task["path"])
+        if key not in seen:
+            seen.add(key); out.append(task)
+    return out[:max_items]
+
+def run_validate_from_report(report_path, outdir, plan_only=False):
+    _validate_safety_args()
+    plan = build_validate_plan_from_report(report_path)
+    os.makedirs(outdir, exist_ok=True)
+    plan_path = os.path.join(outdir, "validate_plan.json")
+    safe_plan = [{"target_hash": _hash_text(item["base"]), "path_hash": _hash_text(item["path"]), "category": categorize_api_path(item["path"]), "source_risk": item.get("source_risk", "")} for item in plan]
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump({"ok": True, "plan_only": bool(plan_only), "task_count": len(plan), "tasks": safe_plan}, f, ensure_ascii=False, indent=2)
+    if plan_only:
+        return {"ok": True, "plan_only": True, "task_count": len(plan), "plan_path": plan_path}
+    results = []
+    for item in plan:
+        findings = test_api(item["base"], item["path"], FAST_BYPASS, short_circuit=True, param_profile=empty_param_profile(), allow_param_probe=False)
+        safe_findings = []
+        for fi in maybe_redact_raw_findings(useful_findings(findings)):
+            safe_findings.append({
+                "risk": fi.get("risk", ""),
+                "method": fi.get("method", ""),
+                "test": fi.get("test", ""),
+                "data_count": fi.get("data_count", 0),
+                "data_keys": fi.get("data_keys", []),
+                "classifier_verdict": fi.get("classifier_verdict", ""),
+                "sensitive_fields": fi.get("sensitive_fields", []),
+                "attack_path_intel": bool(fi.get("attack_path_intel")),
+                "file_leak": bool(fi.get("file_leak")),
+            })
+        results.append({"target_hash": _hash_text(item["base"]), "path_hash": _hash_text(item["path"]), "finding_count": len(findings), "findings": safe_findings})
+    summary = {"ok": True, "plan_only": False, "task_count": len(plan), "results": results, "safety": {"redact_raw_findings": True, "max_rps_per_host": args.max_rps_per_host, "min_delay_ms": args.min_delay_ms, "max_requests_per_host": args.max_requests_per_host, "workers": WORKERS, "phase12_workers": PHASE12_WORKERS}}
+    out_path = os.path.join(outdir, "validate_report.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+    summary["report_path"] = out_path
+    summary["plan_path"] = plan_path
+    return summary
+
 def target_filename(base):
     return re.sub(r'[^a-zA-Z0-9]', '_', base) + ".json"
 
@@ -2242,6 +2468,14 @@ def main():
     if args.debug: print(f"  debug=ON workers={WORKERS} timeout={HTTP_TIMEOUT}s")
     print("="*60)
 
+    if args.validate_from_report:
+        print("\n[Validate-from-report] conservative focused recheck...")
+        summary = run_validate_from_report(args.validate_from_report, OUTDIR, plan_only=args.validate_plan_only)
+        print(f"  tasks={summary.get('task_count')} plan={summary.get('plan_path')}")
+        if summary.get("report_path"):
+            print(f"  report={summary.get('report_path')}")
+        return
+
     targets = dedupe_targets(load_targets(args.input, args.input_format))
     if args.limit > 0: targets = targets[:args.limit]
     print(f"\n[*] 目标: {len(targets)} | 输入: {args.input} ({args.input_format}) | 输出: {OUTDIR}")
@@ -2309,7 +2543,13 @@ def main():
             return None
         if not html:
             apis = set(BASELINE_PATHS) | swagger_apis
+            if args.legacy_recovery:
+                for api in legacy_recovery_candidates():
+                    apis.add(api)
+                    add_api_meta(api_meta, api, "legacy_recovery", 0.30)
             apis = expand_with_prefixes(apis, path_prefixes)
+            if args.legacy_recovery:
+                mark_legacy_recovery_meta(api_meta, apis)
             for api in apis:
                 infer_api_meta(api_meta, api)
             return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"api_meta":api_meta,"sensitive":[],"js_count":0,"param_profile":param_profile,"fallback":"empty_http_response"}
@@ -2354,11 +2594,17 @@ def main():
                 all_apis.add(extra_api)
                 add_api_meta(api_meta, extra_api, "param_binding")
         all_apis.update(swagger_apis)
+        if args.legacy_recovery:
+            for api in legacy_recovery_candidates():
+                all_apis.add(api)
+                add_api_meta(api_meta, api, "legacy_recovery", 0.30)
         all_apis = expand_paths(base, all_apis)
         for api in BASELINE_PATHS:
             add_api_meta(api_meta, api, "baseline")
         all_apis.update(BASELINE_PATHS)
         all_apis = expand_with_prefixes(all_apis, path_prefixes)
+        if args.legacy_recovery:
+            mark_legacy_recovery_meta(api_meta, all_apis)
         clean = sorted((a for a in all_apis if not a.startswith(("SENSITIVE:","INTERNAL_IP:","JDBC:"))), key=lambda api: api_test_order({"api_meta": api_meta}, api))
         for api in clean:
             infer_api_meta(api_meta, api)
@@ -2428,7 +2674,12 @@ def main():
                 )
                 for t in api_results
             ], f, ensure_ascii=False, indent=2)
-        print(f"  API列表: {OUTDIR}/apis.json")
+        current_inventory = os.path.join(OUTDIR, "apis.json")
+        print(f"  API列表: {current_inventory}")
+        if args.compare_inventory:
+            diff_path = args.compare_output or os.path.join(OUTDIR, "inventory_diff.json")
+            diff = write_inventory_diff(current_inventory, args.compare_inventory, diff_path, include_samples=args.include_samples)
+            print(f"  Inventory diff: {diff_path} common={diff['counts']['common']} old_only={diff['counts']['old_only']} new_only={diff['counts']['new_only']}")
         return
 
     # Phase 3: 两阶段测试

@@ -136,6 +136,12 @@ python3 tests/v13_post_body_lab.py
 | `--max-requests-per-host` | 0 | Phase 3 每主机最大请求数硬上限，0=不限制 |
 | `--redact-raw-findings` | false | 写出 checkpoint/report 前移除 finding 内 `raw` 等原始响应字段，避免敏感正文落盘 |
 | `--phase12-workers` | 0 | 单独限制 Phase 1/2 线程池大小，0=沿用当前 `--workers` 派生行为；Phase 3 仍使用 `--workers` |
+| `--legacy-recovery` | false | 启用小型 reviewed legacy 候选集，按 `legacy_recovery` 低置信源(0.30)标记；默认关闭 |
+| `--compare-inventory OLD` | 空 | dry-run 后对比旧 apis.json/phase2_inventory.jsonl，输出默认聚合、不含具体 host/path 的 inventory_diff.json |
+| `--compare-output PATH` | 空 | 指定 inventory diff 输出路径 |
+| `--include-samples` | false | inventory diff 中包含少量 path 样本；默认不输出具体路径 |
+| `--validate-from-report REPORT` | 空 | 从既有 report.json 提取命中端点做保守聚焦复核，自动强制 redaction 与安全限速 |
+| `--validate-plan-only` | false | 仅生成 validate_plan.json，不发起复核请求 |
 | `--full-bypass` | false | 启用 FULL 绕过方法, 默认仍命中断路 |
 | `--collect-all-variants` | false | 命中后继续收集所有绕过/参数变体, 隐含 `--full-bypass`, 小批目标补证据用 |
 | `--debug` | false | 调试日志 |
@@ -421,6 +427,22 @@ name, fileName, key, objectKey, ossKey, resourceId
 ## 文件说明
 
 `pipeline/deep_scanner.py` 是主入口, 自包含, 不 import 其他脚本。其他文件均为早期独立工具, 互不依赖, 保留作参考。
+
+
+## Legacy 恢复、Inventory Diff 与聚焦复核
+
+`--legacy-recovery` 默认关闭。开启后只加入一个小型 reviewed 候选集，用来恢复旧版输出中较常见的 Swagger/OpenAPI/doc、`.action`、file/download/export 类结构化路径；不会恢复 dot-path 伪路径、组件路径拼 API 等历史 artifact。新增候选在 `api_sources` 标记为 `legacy_recovery`，`api_confidence` 为 `0.30`，便于后续排序与审计。
+
+Inventory diff 推荐在 dry-run 后使用：
+
+```bash
+python3 pipeline/deep_scanner.py --input targets.json --dry-run --legacy-recovery \
+  --compare-inventory old_apis.json --outdir results_compare
+```
+
+默认 `inventory_diff.json` 只输出 aggregate counts 与类别统计，例如 common/old_only/new_only、swagger_openapi_doc、file_or_action、dot_path_artifact、low_confidence 等，不输出具体 host/path。只有显式 `--include-samples` 才包含少量 path 样本。
+
+`--validate-from-report report.json` 用于对已有 redacted report 的代表端点做保守复核。它不需要 raw body，会自动强制 `--redact-raw-findings`、`max_rps_per_host<=0.5`、`min_delay_ms>=2000`、`max_requests_per_host<=40`、`workers<=4`、`phase12_workers<=4`，输出 hash 化目标/路径和脱敏 finding 摘要。若只需人工审批计划，使用 `--validate-plan-only`。
 
 ## 安全限流与响应分类
 

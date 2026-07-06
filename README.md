@@ -114,6 +114,13 @@ python3 tests/v13_post_body_lab.py
 | `--input-format` | `targets` | 输入格式: `targets` / `hostport` / `masscan` / `httpx-json` |
 | `--port-scanner` | `none` | 外部端口发现器: `none` / `masscan` / `naabu` / `auto` |
 | `--http-prober` | `internal` | HTTP确认层: `internal` / `httpx` / `auto` |
+| `--expand-api-ports` | 空 | 对显式 host/URL 目标额外探测同主机的 API 后端口(如 `8080,8443,8000,8001`);空=关闭。命中前后端分离站点(前端 :443 + 裸后端 :8080) |
+| `--no-expand-api-ports` | false | 强制关闭同主机 API 端口扇出 |
+| `--expand-api-ports-max-targets` | 200 | 目标数超过阈值时自动跳过端口扇出,避免大批量放大请求;0=不限制 |
+| `--replay-scope` | `host` | 跨 base 回放 API 清单范围: `none`=各 base 独立; `host`=同主机名不同端口共享(默认,命中前后端分离未授权); `global`=所有目标共享(跨实例) |
+| `--replay-max-apis` | 400 | 每个 base 回放注入的 API 上限(按优先级取 Top-N);0=不限制 |
+| `--enable-backend-baseline` | false | 启用小型裸后端高价值 API baseline,适合纯 JSON/API-only 后端二次深挖;默认关闭,避免大批量噪声 |
+| `--extra-api-wordlist` | 空 | 额外 API 路径字典文件,可重复传入;每行一个 `/path` 或完整 URL,用于补齐无 JS 清单的行业/厂商接口 |
 | `--scan-ports` | 常用Web端口 | masscan/naabu 使用的端口列表 |
 | `--scan-rate` | 1000 | masscan/naabu 速率 |
 | `--masscan-bin` | PATH | 指定 masscan/masscan.exe 路径 |

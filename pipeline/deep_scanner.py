@@ -66,10 +66,17 @@ def build_parser():
     parser.add_argument('--no-proxy', action='store_true', help='绕过系统代理(ClashX等)')
     parser.add_argument('--skip-port-probe', action='store_true', help='跳过TCP connect预检,仍保留HTTP/scheme确认')
     parser.add_argument('--allow-unverified-url', action='store_true', help='显式URL的HTTP/scheme确认失败时仍保留输入URL')
+    parser.add_argument('--expand-api-ports', default='', help='对显式host/URL目标额外探测同主机的API后端口(逗号分隔,如8080,8443,8000,8001);空=关闭(默认)。适合单目标/小批量深挖前后端分离站点;大批量会放大请求并可能命中无关本地服务,请配合--expand-api-ports-max-targets')
+    parser.add_argument('--no-expand-api-ports', action='store_true', help='强制关闭同主机API端口扇出')
+    parser.add_argument('--expand-api-ports-max-targets', type=int, default=200, help='目标数超过该阈值时自动跳过端口扇出,避免大批量放大请求;0=不限制')
+    parser.add_argument('--replay-scope', choices=['none','host','global'], default='host', help='跨base回放API清单范围: none=各base独立(旧行为); host=同主机名不同端口共享(默认,命中前后端分离未授权); global=所有目标共享(跨实例,请求量大)')
+    parser.add_argument('--replay-max-apis', type=int, default=400, help='每个base回放注入的API上限(按优先级取Top-N);0=不限制')
     parser.add_argument('--fresh', action='store_true', help='扫描前清理输出目录中的旧JSON报告/checkpoint')
     parser.add_argument('--resume', action='store_true', help='报告阶段合并输出目录中的历史checkpoint(默认只统计本轮结果)')
     parser.add_argument('--disable-file-hunter', action='store_true', help='关闭下载/预览/导出接口专项检测')
     parser.add_argument('--enable-file-baseline', action='store_true', help='启用硬编码文件下载baseline路径(默认关闭)')
+    parser.add_argument('--enable-backend-baseline', action='store_true', help='启用小型裸后端高价值API baseline(默认关闭),用于纯JSON/API-only系统二次深挖')
+    parser.add_argument('--extra-api-wordlist', action='append', default=[], help='额外API路径字典文件,可重复传入;每行一个/path或完整URL,#开头注释')
     parser.add_argument('--file-max-probes', type=int, default=36, help='每个疑似文件接口最多探测次数')
     parser.add_argument('--disable-param-harvest', action='store_true', help='关闭HTML/JS静态参数画像')
     parser.add_argument('--param-max-probes', type=int, default=12, help='每个接口最多静态参数模板探测次数')
@@ -290,6 +297,18 @@ HIGH_YIELD_BASELINE_PATHS = [
     "/api/device/query/devices?page=1&count=10",
     "/api/server/media_server/online/list",
 ]
+BACKEND_BASELINE_PATHS = [
+    # API-only / 前后端分离后台常见高价值裸接口。默认不进入主流程,
+    # 只在 --enable-backend-baseline 下用于小批量二次深挖。
+    "/auth/externalInterfaceApi/list",
+    "/auth/leaveSchool/list",
+    "/auth/company/api/getCompanyList",
+    "/auth/getRandomCode",
+    "/auth/account/getByOpenid/aaaa",
+    "/auth/account/getByOpenid/test",
+    "/auth/account/getByOpenid/1",
+    "/auth/cameraFile/api/outApiCheckPhotos",
+]
 SWAGGER_DOC_PATHS = ["/v2/api-docs", "/v3/api-docs", "/openapi.json", "/swagger.json"]
 AUTH_FAIL_MSGS = [
     "缺少请求授权令牌","token无效","未登录","请登录","Unauthorized","Forbidden",
@@ -324,7 +343,8 @@ FILE_ENDPOINT_PREFIXES = ("download", "export", "preview", "upload", "attach", "
 FILE_PARAM_NAMES = [
     "id","ids","fileId","file_id","attachId","attachmentId","docId","documentId",
     "templateId","recordId","path","filePath","url","fileUrl","name","fileName",
-    "key","objectKey","ossKey","downloadUrl","resourceId","avatar","src"
+    "key","objectKey","ossKey","downloadUrl","resourceId","avatar","src",
+    "photoId","photoIds","cameraId","cameraFileId","cameraFileIds"
 ]
 FILE_SEED_VALUES = [
     "1","2","3","10","100","1000","test","demo","default",
@@ -847,6 +867,9 @@ def prioritized_param_names(profile, path):
         for name in FILE_PARAM_NAMES:
             if name not in names:
                 names.append(name)
+    if any(x in p for x in ("camera", "photo", "checkphotos", "checkphoto")):
+        priority = ["photoId", "photoIds", "cameraId", "cameraFileId", "cameraFileIds", "fileId", "id"]
+        names = priority + [name for name in names if name not in priority]
     if any(x in p for x in ("list", "query", "search", "page")):
         for name in ("pageNum", "pageNo", "page", "current", "pageSize", "size", "limit", "keyword", "name"):
             if name not in names:
@@ -1026,7 +1049,7 @@ def static_priority_apis(t, limit=30):
 
 def phase3_seed_apis(t):
     apis = list(t.get("apis", []))
-    seed = list(apis[:30]) + static_priority_apis({"apis": apis}) + BASELINE_PATHS
+    seed = list(apis[:30]) + static_priority_apis({"apis": apis}) + configured_backend_baseline_paths() + BASELINE_PATHS
     seen, out = set(), []
     for api in sorted(seed, key=lambda item: api_test_order(t, item)):
         clean = api.split("?")[0].rstrip("/")
@@ -1114,6 +1137,8 @@ API_CONFIDENCE_TIERS = {
     "js-graph": 0.80,
     "js_literal": 0.75,
     "business_pattern": 0.55,
+    "backend_baseline": 0.50,
+    "extra_wordlist": 0.50,
     "baseline": 0.35,
     "legacy_recovery": 0.30,
     "legacy_baseline": 0.30,
@@ -1246,7 +1271,7 @@ def phase3_seed_tasks(api_results):
     return round_robin_tasks(api_results, phase3_seed_apis)
 
 def high_yield_probe_apis(t):
-    return unique_apis(HIGH_YIELD_BASELINE_PATHS + static_priority_apis(t, limit=12))
+    return unique_apis(HIGH_YIELD_BASELINE_PATHS + configured_backend_baseline_paths() + static_priority_apis(t, limit=12))
 
 def high_yield_probe_tasks(api_results, exclude_bases=None):
     exclude_bases = exclude_bases or set()
@@ -1282,6 +1307,22 @@ def bound_param_tasks(api_results, max_per_target=4):
             out.append(clean_api)
         return unique_apis(out)
     return round_robin_tasks(api_results, provider, max_per_target=max_per_target)
+
+def configured_backend_param_tasks(api_results):
+    configured = configured_backend_baseline_paths()
+    if not configured:
+        return []
+    configured_clean = {api.split("?")[0].rstrip("/") for api in configured}
+    def provider(t):
+        out = []
+        for api in t["apis"]:
+            clean_api = api.split("?")[0].rstrip("/")
+            if not clean_api:
+                continue
+            if clean_api in configured_clean or any(clean_api.endswith(p) for p in configured_clean):
+                out.append(clean_api)
+        return unique_apis(out)
+    return round_robin_tasks(api_results, provider)
 
 def layer_tasks_for_candidates(candidates, api_provider, layer_name, collect_all=False):
     def provider(t):
@@ -1329,6 +1370,100 @@ def normalize_extracted_api(path):
         if safe_parts:
             return path + "?" + "&".join(safe_parts)
     return path
+
+def normalize_wordlist_api(line):
+    value = (line or "").strip().strip('"\'`')
+    if not value or value.startswith("#"):
+        return ""
+    value = value.split("#", 1)[0].strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        value = parsed.path or "/"
+        if parsed.query:
+            value += "?" + parsed.query
+    elif value.startswith("//"):
+        parsed = urlparse("http:" + value)
+        value = parsed.path or "/"
+        if parsed.query:
+            value += "?" + parsed.query
+    if not value.startswith("/"):
+        value = "/" + value
+    path, sep, query = value.partition("?")
+    path = path.split("#", 1)[0].rstrip("/")
+    if not (2 < len(path) < 250):
+        return ""
+    if "\ufffd" in path or re.search(r"[\x00-\x1f\x7f\s]", path):
+        return ""
+    if not re.search(r"[A-Za-z0-9]", path):
+        return ""
+    if re.search(r"[^\w./{}:$@%+=,;&?~!()\\[\\]\-\u4e00-\u9fff]", path, re.UNICODE):
+        return ""
+    if sep:
+        safe_parts = []
+        for part in query.split("&")[:8]:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_.-]{0,40}=[A-Za-z0-9_.:@%+,\-]{0,160}$", part):
+                safe_parts.append(part)
+        if safe_parts:
+            return path + "?" + "&".join(safe_parts)
+    return path
+
+def load_extra_api_wordlists(paths):
+    out = []
+    for path in paths or []:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    api = normalize_wordlist_api(line)
+                    if api:
+                        out.append(api)
+        except Exception as e:
+            log.warning(f"Load extra API wordlist failed: {path}: {e}")
+    return unique_apis_keep_order(out)
+
+def configured_backend_baseline_paths():
+    items = []
+    if args.enable_backend_baseline:
+        items.extend(BACKEND_BASELINE_PATHS)
+    items.extend(EXTRA_API_WORDLIST_PATHS)
+    return unique_apis_keep_order(items)
+
+EXTRA_API_WORDLIST_PATHS = load_extra_api_wordlists(args.extra_api_wordlist)
+
+def backend_probe_param_profile(path):
+    profile = empty_param_profile()
+    names = {
+        "id", "ids", "page", "pageNum", "pageNo", "current", "size", "pageSize",
+        "limit", "count", "keyword", "name", "openid", "openId", "userId",
+        "accountId", "companyId", "schoolId", "studentId", "fileId", "photoId",
+        "photoIds", "cameraId", "cameraFileId", "cameraFileIds",
+    }
+    profile["names"].update(names)
+    profile["seeds"].update({"1", "2", "10", "100", "test", "aaaa"})
+    clean = path.split("?")[0].rstrip("/")
+    for name in names:
+        add_api_param(profile, clean, name, source="query")
+    return profile
+
+def add_configured_backend_paths(api_set, api_meta, path_prefixes=None):
+    backend_paths = configured_backend_baseline_paths()
+    if not backend_paths:
+        return api_set
+    expanded = set(backend_paths)
+    if path_prefixes:
+        expanded = expand_with_prefixes(expanded, path_prefixes)
+    backend_clean = {p.split("?")[0].rstrip("/") for p in BACKEND_BASELINE_PATHS}
+    for api in expanded:
+        api_set.add(api)
+        clean = api.split("?")[0].rstrip("/")
+        if args.enable_backend_baseline and any(clean == p or clean.endswith(p) for p in backend_clean):
+            add_api_meta(api_meta, api, "backend_baseline")
+        if any(clean == p or clean.endswith(p) for p in {p.split("?")[0].rstrip("/") for p in EXTRA_API_WORDLIST_PATHS}):
+            add_api_meta(api_meta, api, "extra_wordlist")
+    return api_set
 
 def valid_sensitive_value(value):
     value = (value or "").strip()
@@ -1706,6 +1841,25 @@ def json_data_count(obj, depth=0):
                 return count
     return 0
 
+JWT_LIKE_RE = re.compile(r"\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]*\b")
+
+def has_credential_value(obj, depth=0):
+    if depth > 5:
+        return False
+    if isinstance(obj, str):
+        text = obj.strip()
+        return bool(JWT_LIKE_RE.search(text) or re.search(r"\b(?:access[_-]?token|refresh[_-]?token|authorization)\b", text, re.I))
+    if isinstance(obj, list):
+        return any(has_credential_value(item, depth + 1) for item in obj[:20])
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_s = str(key).lower()
+            if any(k in key_s for k in ("token", "jwt", "authorization", "session")) and value not in (None, "", [], {}):
+                return True
+            if has_credential_value(value, depth + 1):
+                return True
+    return False
+
 def is_framework_not_found_json(parsed):
     if not isinstance(parsed, dict):
         return False
@@ -1743,7 +1897,9 @@ def check_response(body, url, method, test_name, status_code=None):
         if not data_source:
             for parent_key in ("result", "page", "payload"):
                 parent = parsed.get(parent_key)
-                if isinstance(parent, dict):
+                if isinstance(parent, list) and parent:
+                    data_source = parent
+                elif isinstance(parent, dict):
                     for child_key in ("records", "list", "items", "rows", "data"):
                         if parent.get(child_key):
                             data_source = parent.get(child_key)
@@ -1769,7 +1925,8 @@ def check_response(body, url, method, test_name, status_code=None):
                 count = json_data_count(data_source)
                 if count:
                     f["data_count"] = count
-            if "secret" in body.lower() or "password" in body.lower(): f["credential_leak"]=True
+            if "secret" in body.lower() or "password" in body.lower() or has_credential_value(parsed):
+                f["credential_leak"]=True
             f["risk"] = risk_level(f)
             f["raw"] = body[:500]
             return f
@@ -1780,7 +1937,10 @@ def check_response(body, url, method, test_name, status_code=None):
         f["classifier_reasons"] = classifier_summary.get("reasons", [])
         f["sensitive_fields"] = classifier_summary.get("sensitive_fields", [])
         f["data_signals"] = classifier_summary.get("data_signals", {})
-        if isinstance(parsed[0], dict): f["data_keys"] = list(parsed[0].keys())[:15]; f["risk"] = risk_level(f)
+        if has_credential_value(parsed):
+            f["credential_leak"] = True
+        if isinstance(parsed[0], dict): f["data_keys"] = list(parsed[0].keys())[:15]
+        f["risk"] = risk_level(f)
         return f
     elif attack_path_ok:
         f = {"url":url,"method":method,"test":test_name,"attack_path_intel":True,"risk":"MEDIUM","raw":body[:500]}
@@ -2404,6 +2564,7 @@ def baseline_api_result(url):
     api_meta = {}
     for api in apis:
         add_api_meta(api_meta, api, "baseline")
+    apis = add_configured_backend_paths(apis, api_meta, prefixes)
     return {"base":base,"title":"","apis":sorted(apis, key=api_priority),"api_meta":api_meta,"sensitive":[],"js_count":0,"param_profile":empty_param_profile(),"fallback":"phase2_timeout"}
 
 def add_task(tasks, seen, t, api, layer):
@@ -2460,6 +2621,55 @@ def run_task_pool(tasks, worker_count, timeout, label, fn, on_result, progress_e
         pool.shutdown(wait=False, cancel_futures=True)
     return completed, len(pending)
 
+def apply_cross_base_replay(api_results, scope, max_apis):
+    """按 host/global 计算各 base 缺失的、其它同组 base 挖到的 API,存入 replay_apis。
+
+    命中前后端分离/多端口部署场景: 前端页面(如 :443)JS 挖出的接口清单会回放到
+    同主机的裸后端(如 :8080),后端若未做鉴权即可被 Phase 3 命中。
+
+    只写入 delta(本 base 自己没有的路径)到 t["replay_apis"],不修改 t["apis"],
+    从而完全保留每个 base 原有的 seed/param/body 探测逻辑;回放作为额外探测层执行。
+    返回 (新增回放API总数, 受影响的base数)。
+    """
+    if scope == "none" or len(api_results) < 2:
+        return 0, 0
+
+    def group_key(base):
+        if scope == "global":
+            return "*"
+        return (urlparse(base).hostname or "").lower()
+
+    groups = {}
+    for t in api_results:
+        groups.setdefault(group_key(t["base"]), []).append(t)
+
+    total_added, touched = 0, 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        union = unique_apis([a for t in members for a in t.get("apis", [])])
+        merged_meta = {}
+        for t in members:
+            for k, v in (t.get("api_meta") or {}).items():
+                merged_meta.setdefault(k, v)
+        for t in members:
+            own = {a.split("?")[0].rstrip("/") for a in t.get("apis", [])}
+            delta = [a for a in union if a.split("?")[0].rstrip("/") not in own]
+            if max_apis and max_apis > 0:
+                delta = delta[:max_apis]
+            if not delta:
+                continue
+            t["replay_apis"] = delta
+            meta = t.setdefault("api_meta", {})
+            for api in delta:
+                if api in merged_meta:
+                    meta.setdefault(api, merged_meta[api])
+            t["cross_replay_added"] = len(delta)
+            total_added += len(delta)
+            touched += 1
+    return total_added, touched
+
+
 # ===== 主流程 =====
 def main():
     print("="*60)
@@ -2482,15 +2692,38 @@ def main():
     targets = run_port_discovery(targets)
 
     # Phase 1: HTTP/scheme normalization
+    expand_ports = []
+    if not args.no_expand_api_ports and args.expand_api_ports.strip():
+        cap = args.expand_api_ports_max_targets
+        if cap and cap > 0 and len(targets) > cap:
+            print(f"  端口扇出跳过: 目标数 {len(targets)} > 阈值 {cap} (改用 --port-scanner 预检)")
+        else:
+            for tok in args.expand_api_ports.split(','):
+                tok = tok.strip()
+                if tok.isdigit():
+                    p = int(tok)
+                    if p not in expand_ports:
+                        expand_ports.append(p)
     live = run_httpx_probe(targets)
     if live is None:
         print(f"\n[Phase 1] HTTP确认+scheme规范化{' (skip TCP)' if args.skip_port_probe else ''}...")
+        if expand_ports:
+            print(f"  同主机API端口扇出: {expand_ports}")
         live, done = [], 0
         def probe(t_url):
             normalized, host, port = target_url_with_scheme(t_url)
             if normalized and host and port:
+                bases = []
                 base = reachable_base_url(host, port, normalized)
-                return [base] if base else []
+                if base:
+                    bases.append(base)
+                for xp in expand_ports:
+                    if xp == port:
+                        continue
+                    xbase = reachable_base_url(host, xp)
+                    if xbase and xbase not in bases:
+                        bases.append(xbase)
+                return bases
             elif host:
                 bases = []
                 for port in WEB_PORTS:
@@ -2519,7 +2752,8 @@ def main():
     # Phase 2: JS爬取
     print(f"\n[Phase 2] JS爬取+API提取...")
     bypass_used = FULL_BYPASS if args.full_bypass else FAST_BYPASS
-    print(f"  绕过: {'FULL(6种)' if args.full_bypass else 'FAST(2种,短路)'} | dry-run={args.dry_run} | file-hunter={not args.disable_file_hunter} | file-baseline={args.enable_file_baseline and not args.disable_file_hunter} | param-harvest={not args.disable_param_harvest}")
+    backend_baseline_count = len(configured_backend_baseline_paths())
+    print(f"  绕过: {'FULL(6种)' if args.full_bypass else 'FAST(2种,短路)'} | dry-run={args.dry_run} | file-hunter={not args.disable_file_hunter} | file-baseline={args.enable_file_baseline and not args.disable_file_hunter} | backend-baseline={args.enable_backend_baseline}({backend_baseline_count}) | extra-wordlist={len(EXTRA_API_WORDLIST_PATHS)} | param-harvest={not args.disable_param_harvest}")
     if args.min_delay_ms or args.max_rps_per_host or args.max_requests_per_host:
         print(f"  Phase3 safety: min_delay_ms={args.min_delay_ms} max_rps_per_host={args.max_rps_per_host} max_requests_per_host={args.max_requests_per_host}")
     if PHASE12_WORKERS:
@@ -2543,6 +2777,7 @@ def main():
             return None
         if not html:
             apis = set(BASELINE_PATHS) | swagger_apis
+            apis = add_configured_backend_paths(apis, api_meta, path_prefixes)
             if args.legacy_recovery:
                 for api in legacy_recovery_candidates():
                     apis.add(api)
@@ -2602,6 +2837,7 @@ def main():
         for api in BASELINE_PATHS:
             add_api_meta(api_meta, api, "baseline")
         all_apis.update(BASELINE_PATHS)
+        all_apis = add_configured_backend_paths(all_apis, api_meta, path_prefixes)
         all_apis = expand_with_prefixes(all_apis, path_prefixes)
         if args.legacy_recovery:
             mark_legacy_recovery_meta(api_meta, all_apis)
@@ -2659,6 +2895,11 @@ def main():
         pool.shutdown(wait=False, cancel_futures=True)
     print(f"  Phase 2 DONE: {len(api_results)} hosts")
     print(f"  Phase 2 inventory: {OUTDIR}/{PHASE2_INVENTORY_NAME}")
+
+    if args.replay_scope != "none":
+        added, touched = apply_cross_base_replay(api_results, args.replay_scope, args.replay_max_apis)
+        if touched:
+            print(f"  跨base回放: scope={args.replay_scope} 注入 {added} 条API到 {touched} 个base (前后端分离/多端口未授权)")
 
     if args.dry_run:
         print(f"\n[Dry-run] 跳过测试, 输出API列表")
@@ -2723,6 +2964,20 @@ def main():
         pool.shutdown(wait=False, cancel_futures=True)
     print(f"  3a/fast 耗时: {time.time()-t_start:.0f}s")
 
+    replay_tasks = [(t, api) for t in api_results for api in t.get("replay_apis", [])]
+    if replay_tasks:
+        print(f"  3a/replay: {len(replay_tasks)} cross-base tasks")
+        t_start = time.time()
+        def test_replay(task):
+            t, api = task
+            return t["base"], test_api(t["base"], api, FAST_BYPASS, short_circuit=True, param_profile=t.get("param_profile"), allow_param_probe=False)
+        def handle_replay(result):
+            base_url, findings = result
+            if findings:
+                target_map[base_url]["_f"].extend(findings)
+        run_task_pool(replay_tasks, WORKERS*2, args.phase3a_timeout, "3a/replay", test_replay, handle_replay)
+        print(f"  3a/replay 耗时: {time.time()-t_start:.0f}s")
+
     body_fast_tasks = bound_body_tasks(api_results, max_per_target=4)
     if body_fast_tasks:
         print(f"  3a/body-fast: {len(body_fast_tasks)} bound POST tasks")
@@ -2753,6 +3008,22 @@ def main():
                     target_map[base_url]["_f"].extend(findings)
             run_task_pool(rescue_param_tasks, WORKERS, args.phase3a_timeout, "3a/param-rescue", test_param_rescue, handle_param_rescue)
             print(f"  3a/param-rescue 耗时: {time.time()-t_start:.0f}s")
+
+    backend_param_tasks = configured_backend_param_tasks(api_results)
+    if backend_param_tasks:
+        print(f"  3a/backend-param: {len(backend_param_tasks)} configured backend-param tasks")
+        t_start = time.time()
+        def test_backend_param(task):
+            t, api = task
+            profile = backend_probe_param_profile(api)
+            merge_param_profiles(profile, t.get("param_profile") or empty_param_profile())
+            return t["base"], test_api(t["base"], api, FAST_BYPASS, short_circuit=True, param_profile=profile, allow_param_probe=True)
+        def handle_backend_param(result):
+            base_url, findings = result
+            if findings:
+                target_map[base_url]["_f"].extend(findings)
+        run_task_pool(backend_param_tasks, WORKERS, args.phase3a_timeout, "3a/backend-param", test_backend_param, handle_backend_param)
+        print(f"  3a/backend-param 耗时: {time.time()-t_start:.0f}s")
 
     candidates = []
     for base, t in target_map.items():

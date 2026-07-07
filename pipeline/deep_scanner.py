@@ -78,6 +78,8 @@ def build_parser():
     parser.add_argument('--enable-backend-baseline', action='store_true', help='启用小型裸后端高价值API baseline(默认关闭),用于纯JSON/API-only系统二次深挖')
     parser.add_argument('--extra-api-wordlist', action='append', default=[], help='额外API路径字典文件,可重复传入;每行一个/path或完整URL,#开头注释')
     parser.add_argument('--file-max-probes', type=int, default=36, help='每个疑似文件接口最多探测次数')
+    parser.add_argument('--disable-api-fuzz', action='store_true', help='关闭Phase 2.5 API字典模糊发现(对JS零发现目标注入内置字典)')
+    parser.add_argument('--api-fuzz-wordlist', default='', help='Phase 2.5额外API字典文件路径(默认使用内置wordlists/api_paths.txt)')
     parser.add_argument('--disable-param-harvest', action='store_true', help='关闭HTML/JS静态参数画像')
     parser.add_argument('--param-max-probes', type=int, default=12, help='每个接口最多静态参数模板探测次数')
     parser.add_argument('--param-probe-mode', choices=['targeted','broad'], default='targeted', help='静态参数探测模式: targeted仅高价值接口,broad全部接口')
@@ -115,6 +117,79 @@ SSL_RETRIES = 2; OUTDIR = args.outdir
 PHASE3_RATE_LOCK = Lock()
 PHASE3_RATE_STATE = {}
 PHASE2_INVENTORY_NAME = "phase2_inventory.jsonl"
+PHASE2_FULL_NAME = "phase2_full.jsonl"
+
+class StreamedResultSet:
+    """Lazy iterable over a JSONL file of per-target scan results.
+
+    Replaces the old in-memory `api_results: list[dict]` so 200+ targets
+    don't all sit in RAM at once. Supports ``len()``, ``for … in``, and
+    ``filtered(predicate)``.  List-like indexing (``[i]``) is deliberately
+    NOT provided — it encourages materialising the whole file.
+    """
+
+    def __init__(self, path, count):
+        self._path = path
+        self._count = count
+
+    def __len__(self):
+        return self._count
+
+    def __iter__(self):
+        if not os.path.exists(self._path):
+            return
+        with open(self._path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+    def filtered(self, predicate):
+        """Return a new StreamedResultSet (same file) yielding only matches.
+
+        *count* is reset to 0 because we can't know the filtered size ahead
+        of time — callers that need an accurate len should materialise.
+        """
+        parent = self
+
+        class _Filtered:
+            def __len__(_s):
+                return 0  # unknown; fall back to iteration
+
+            def __iter__(_s):
+                for rec in parent:
+                    if predicate(rec):
+                        yield rec
+
+        return _Filtered()
+
+    def materialize(self):
+        """Read every record into a plain list. Use only when you genuinely
+        need random access (e.g. cross-base replay)."""
+        return list(iter(self))
+
+class _JsonlWriter:
+    """Thread-safe append-only JSONL writer."""
+    def __init__(self, path):
+        self._path = path
+        self._lock = Lock()
+        self._count = 0
+
+    def write(self, record):
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            self._count += 1
+
+    @property
+    def count(self):
+        return self._count
+
 os.makedirs(OUTDIR, exist_ok=True)
 if args.fresh:
     checkpoint_re = re.compile(r'^(?:https?___|[a-zA-Z0-9_.-]+_\\d+).*\\.json$')
@@ -308,6 +383,9 @@ BACKEND_BASELINE_PATHS = [
     "/auth/account/getByOpenid/test",
     "/auth/account/getByOpenid/1",
     "/auth/cameraFile/api/outApiCheckPhotos",
+    # 2026-07-07 国网实战发现：前后端分离框架的自定义裸API
+    "/main/outworkapi/users",
+    "/main/outworkapi",
 ]
 SWAGGER_DOC_PATHS = ["/v2/api-docs", "/v3/api-docs", "/openapi.json", "/swagger.json"]
 AUTH_FAIL_MSGS = [
@@ -1433,6 +1511,21 @@ def configured_backend_baseline_paths():
 
 EXTRA_API_WORDLIST_PATHS = load_extra_api_wordlists(args.extra_api_wordlist)
 
+# Auto-load built-in API wordlist for Phase 2.5 sparse-target fuzz.
+# Operators can disable with --disable-api-fuzz or override with --api-fuzz-wordlist.
+_BUILTIN_WORDLIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "wordlists", "api_paths.txt")
+if not os.path.exists(_BUILTIN_WORDLIST):
+    _BUILTIN_WORDLIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wordlists", "api_paths.txt")
+API_FUZZ_WORDLIST_PATHS: list[str] = []
+if not args.disable_api_fuzz:
+    wl_path = args.api_fuzz_wordlist or _BUILTIN_WORDLIST
+    if os.path.exists(wl_path):
+        API_FUZZ_WORDLIST_PATHS = load_extra_api_wordlists([wl_path])
+
+_API_SOURCE_ORDER = {"swagger": 10, "js": 9, "html": 8, "vue_router": 7, "react_route": 6,
+                     "extra_wordlist": 5, "backend_baseline": 4, "param_binding": 3,
+                     "baseline": 2, "legacy_recovery": 1, "": 0}
+
 def backend_probe_param_profile(path):
     profile = empty_param_profile()
     names = {
@@ -2556,6 +2649,80 @@ def load_checkpoint_results():
             log.debug(f"Load checkpoint {path} failed: {e}")
     return items
 
+
+def _phase25_sparse_api_fuzz(phase2_path, api_results, wordlist, outdir, inventory_name):
+    """Phase 2.5: Inject wordlist APIs into targets where JS extraction found nothing.
+
+    A target is "sparse" when js_count==0 AND no API came from a non-baseline
+    source (js/html/swagger/vue_router/react_route).  The wordlist APIs are
+    added with source ``api_fuzz`` (confidence 0.45) so they participate in
+    Phase 3 probing but don't override higher-confidence discoveries.
+
+    Returns the path to the augmented JSONL file.
+    """
+    if not wordlist:
+        return phase2_path
+
+    # Collect sparse bases
+    sparse_bases: set[str] = set()
+    for t in api_results:
+        js_count = int(t.get("js_count") or 0)
+        api_sources = t.get("api_sources") or {}
+        max_source_conf = 0
+        for src_list in api_sources.values():
+            for src in (src_list if isinstance(src_list, list) else [src_list]):
+                conf = _API_SOURCE_ORDER.get(str(src), 0)
+                if conf > max_source_conf:
+                    max_source_conf = conf
+        if js_count == 0 and max_source_conf <= 4:  # only baseline (2) or backend_baseline (4)
+            sparse_bases.add(t.get("base", ""))
+
+    if not sparse_bases:
+        return phase2_path
+
+    augmented = phase2_path + ".fuzz"
+    writer = _JsonlWriter(augmented)
+    injected = 0
+
+    for t in api_results:
+        base = t.get("base", "")
+        if base in sparse_bases:
+            existing_apis = {a.rstrip("/") for a in (t.get("apis") or [])}
+            new_apis = []
+            for wl_api in wordlist:
+                if wl_api not in existing_apis:
+                    new_apis.append(wl_api)
+                    existing_apis.add(wl_api)
+            if new_apis:
+                apis = list(t.get("apis") or []) + new_apis
+                t = dict(t)
+                t["apis"] = apis
+                t.setdefault("api_sources", {})
+                t.setdefault("api_confidence", {})
+                for api in new_apis:
+                    t["api_sources"][api] = ["api_fuzz"]
+                    t["api_confidence"][api] = 0.45
+                injected += len(new_apis)
+        writer.write(t)
+
+    if injected:
+        print(f"  Phase 2.5: injected {injected} APIs into {len(sparse_bases)} sparse bases (js=0, no custom APIs)")
+        # Rewrite inventory too
+        inv_path = os.path.join(outdir, inventory_name)
+        if os.path.exists(inv_path):
+            inv_fuzz = inv_path + ".fuzz"
+            with open(inv_path, "r", encoding="utf-8") as fin, open(inv_fuzz, "w", encoding="utf-8") as fout:
+                for line in fin:
+                    rec = json.loads(line.strip())
+                    b = rec.get("base", "")
+                    if b in sparse_bases:
+                        rec["api_count"] = rec.get("api_count", 0) + len([a for a in wordlist if a not in {x.rstrip("/") for x in rec.get("apis", [])}])
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            os.replace(inv_fuzz, inv_path)
+        return augmented
+    return phase2_path
+
+
 def baseline_api_result(url):
     base = origin_from_url(url)
     page_url = url if url.endswith("/") else url + "/"
@@ -2753,7 +2920,8 @@ def main():
     print(f"\n[Phase 2] JS爬取+API提取...")
     bypass_used = FULL_BYPASS if args.full_bypass else FAST_BYPASS
     backend_baseline_count = len(configured_backend_baseline_paths())
-    print(f"  绕过: {'FULL(6种)' if args.full_bypass else 'FAST(2种,短路)'} | dry-run={args.dry_run} | file-hunter={not args.disable_file_hunter} | file-baseline={args.enable_file_baseline and not args.disable_file_hunter} | backend-baseline={args.enable_backend_baseline}({backend_baseline_count}) | extra-wordlist={len(EXTRA_API_WORDLIST_PATHS)} | param-harvest={not args.disable_param_harvest}")
+    api_fuzz_count = len(API_FUZZ_WORDLIST_PATHS) if not args.disable_api_fuzz else 0
+    print(f"  绕过: {'FULL(6种)' if args.full_bypass else 'FAST(2种,短路)'} | dry-run={args.dry_run} | file-hunter={not args.disable_file_hunter} | file-baseline={args.enable_file_baseline and not args.disable_file_hunter} | backend-baseline={args.enable_backend_baseline}({backend_baseline_count}) | extra-wordlist={len(EXTRA_API_WORDLIST_PATHS)} | api-fuzz={api_fuzz_count} | param-harvest={not args.disable_param_harvest}")
     if args.min_delay_ms or args.max_rps_per_host or args.max_requests_per_host:
         print(f"  Phase3 safety: min_delay_ms={args.min_delay_ms} max_rps_per_host={args.max_rps_per_host} max_requests_per_host={args.max_requests_per_host}")
     if PHASE12_WORKERS:
@@ -2761,7 +2929,8 @@ def main():
     if args.redact_raw_findings:
         print("  Finding raw redaction: ON")
 
-    api_results, done = [], 0
+    api_writer = _JsonlWriter(os.path.join(OUTDIR, PHASE2_FULL_NAME))
+    done = 0
     def crawl(url):
         base = origin_from_url(url)
         page_url = url if url.endswith("/") else url + "/"
@@ -2876,11 +3045,11 @@ def main():
                 try:
                     r = f.result()
                     if r:
-                        api_results.append(r)
+                        api_writer.write(r)
                         write_phase2_inventory(r)
                 except Exception as e:
                     log.debug(f"Crawl failed: {e}")
-                if done % 10 == 0 or done == len(live): print(f"  [{done}/{len(live)}] {len(api_results)} with APIs")
+                if done % 10 == 0 or done == len(live): print(f"  [{done}/{len(live)}] {api_writer.count} with APIs")
         if pending:
             print(f"  Phase 2 soft-timeout: {len(pending)} hosts fallback to baseline")
             for f in pending:
@@ -2888,16 +3057,43 @@ def main():
                 f.cancel()
                 done += 1
                 fallback = baseline_api_result(url)
-                api_results.append(fallback)
+                api_writer.write(fallback)
                 write_phase2_inventory(fallback)
-            print(f"  [{done}/{len(live)}] {len(api_results)} with APIs")
+            print(f"  [{done}/{len(live)}] {api_writer.count} with APIs")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    print(f"  Phase 2 DONE: {len(api_results)} hosts")
+    print(f"  Phase 2 DONE: {api_writer.count} hosts")
+    print(f"  Phase 2 full results: {OUTDIR}/{PHASE2_FULL_NAME}")
     print(f"  Phase 2 inventory: {OUTDIR}/{PHASE2_INVENTORY_NAME}")
 
+    # Replace the in-memory list with a disk-backed stream. Large scans
+    # (200+ targets × hundreds of APIs each) would otherwise keep every
+    # result dict and its API lists in RAM until Phase 3 finishes.
+    phase2_path = os.path.join(OUTDIR, PHASE2_FULL_NAME)
+    api_results = StreamedResultSet(phase2_path, api_writer.count)
+    del api_writer  # free the writer lock
+
+    # ── Phase 2.5: API dictionary fuzz for sparse (JS-free) targets ──
+    if API_FUZZ_WORDLIST_PATHS:
+        phase2_path = _phase25_sparse_api_fuzz(
+            phase2_path, api_results, API_FUZZ_WORDLIST_PATHS, OUTDIR, PHASE2_INVENTORY_NAME
+        )
+        api_results = StreamedResultSet(phase2_path, len(api_results) if hasattr(api_results, '__len__') else 0)
+        print(f"  Phase 2.5 API fuzz: {len(API_FUZZ_WORDLIST_PATHS)} wordlist paths")
+
     if args.replay_scope != "none":
-        added, touched = apply_cross_base_replay(api_results, args.replay_scope, args.replay_max_apis)
+        # Materialise is unavoidable here — cross-base replay needs all
+        # results at once to compute group-level API unions. It releases
+        # the list when it returns, so the peak is temporary.
+        added, touched = apply_cross_base_replay(list(api_results), args.replay_scope, args.replay_max_apis)
+        if touched:
+            # Re-write results with replay_apis added so Phase 3 sees them.
+            _replay_path = phase2_path + ".replay"
+            _w = _JsonlWriter(_replay_path)
+            for t in api_results:
+                _w.write(t)
+            phase2_path = _replay_path
+            api_results = StreamedResultSet(phase2_path, _w.count)
         if touched:
             print(f"  跨base回放: scope={args.replay_scope} 注入 {added} 条API到 {touched} 个base (前后端分离/多端口未授权)")
 

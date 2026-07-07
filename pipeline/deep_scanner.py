@@ -68,7 +68,7 @@ def build_parser():
     parser.add_argument('--allow-unverified-url', action='store_true', help='显式URL的HTTP/scheme确认失败时仍保留输入URL')
     parser.add_argument('--expand-api-ports', default='', help='对显式host/URL目标额外探测同主机的API后端口(逗号分隔,如8080,8443,8000,8001);空=关闭(默认)。适合单目标/小批量深挖前后端分离站点;大批量会放大请求并可能命中无关本地服务,请配合--expand-api-ports-max-targets')
     parser.add_argument('--no-expand-api-ports', action='store_true', help='强制关闭同主机API端口扇出')
-    parser.add_argument('--expand-api-ports-max-targets', type=int, default=200, help='目标数超过该阈值时自动跳过端口扇出,避免大批量放大请求;0=不限制')
+    parser.add_argument('--expand-api-ports-max-targets', type=int, default=0, help='目标数超过该阈值时自动跳过端口扇出;0=不限制。分布式模式下建议传 --expand-api-ports-max-targets 0')
     parser.add_argument('--replay-scope', choices=['none','host','global'], default='host', help='跨base回放API清单范围: none=各base独立(旧行为); host=同主机名不同端口共享(默认,命中前后端分离未授权); global=所有目标共享(跨实例,请求量大)')
     parser.add_argument('--replay-max-apis', type=int, default=400, help='每个base回放注入的API上限(按优先级取Top-N);0=不限制')
     parser.add_argument('--fresh', action='store_true', help='扫描前清理输出目录中的旧JSON报告/checkpoint')

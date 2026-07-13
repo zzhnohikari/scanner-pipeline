@@ -3,6 +3,40 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 
+# Local environments, build products, and test coverage.
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
 # Local scan artifacts and saved target JS/report material.
 reports/
+/runs/
+/output/
+/outputs/
+/evidence/
+/captures/
+/artifacts/
+*.log
+
+# Local credentials and private key material.
+.env
+.env.*
+!.env.example
+credentials*.json
+secrets*.json
+token*.txt
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
 tools/save_gh_esgcc_hnb_static.py

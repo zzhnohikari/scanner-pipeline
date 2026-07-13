@@ -180,6 +180,7 @@ def build_parser():
     parser.add_argument('--unauth-matrix', action='store_true', help='dry-run时输出未授权/IDOR矩阵预览，不发送额外请求')
     parser.add_argument('--include-delete-method', action='store_true', help='默认跳过JS/OpenAPI中明确标注为HTTP DELETE方法的接口；显式开启后才纳入扫描')
     parser.add_argument('--allow-active-post', action='store_true', help='显式允许对已观测到且有body参数的动作型POST接口发送请求；默认仅探测明确的只读型POST')
+    parser.add_argument('--post-every-api', action='store_true', help='显式授权每条独立精确API在GET之外发送一次POST；无body证据时发送零长度body，不授权PUT/PATCH/DELETE或文件上传')
     parser.add_argument('--redact-raw-findings', action='store_true', help='写出checkpoint/report前移除finding中的raw原始响应字段，避免敏感正文落盘')
     parser.add_argument('--capture-finding-evidence', action='store_true', default=True, help='漏洞产出后复核一次并保存完整HTTP请求/响应证据包到outdir/evidence')
     parser.add_argument('--no-capture-finding-evidence', dest='capture_finding_evidence', action='store_false', help='关闭漏洞证据复核与原始HTTP包落盘')
@@ -239,6 +240,19 @@ REPLAY_PROFILE_INDEX_BUILD_COUNT = 0
 API_META_INDEX_CONTEXT = local()
 
 
+def _payload_shape(value, depth=0):
+    if depth >= 4:
+        return "bounded"
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _payload_shape(value[key], depth + 1))
+            for key in sorted(value, key=str)[:16]
+        )
+    if isinstance(value, (list, tuple)):
+        return ("list", _payload_shape(value[0], depth + 1)) if value else ("list",)
+    return "scalar"
+
+
 def phase3_probe_mode(method, content_type=None, headers=None, query_suffix="", payload=None):
     safe_headers = tuple(sorted(
         (str(key).strip().lower(), str(value).strip())
@@ -250,7 +264,7 @@ def phase3_probe_mode(method, content_type=None, headers=None, query_suffix="", 
         str(content_type or "").split(";", 1)[0].strip().lower(),
         safe_headers,
         tuple(sorted({key for key, _value in parse_qsl(str(query_suffix or "").lstrip("?"), keep_blank_values=True)})),
-        tuple(sorted(str(key) for key in payload)) if isinstance(payload, dict) else (),
+        _payload_shape(payload) if isinstance(payload, dict) else (),
     )
 
 
@@ -287,6 +301,28 @@ def _empty_api_coverage_state(valid_inventory=0):
         "scheduled_unique_exact": 0,
         "attempted_unique_exact": 0,
         "completed_unique_exact": 0,
+        "exact_get_eligible": 0,
+        "exact_get_scheduled": 0,
+        "exact_get_attempted": 0,
+        "exact_get_completed": 0,
+        "exact_get_skipped_by_request_budget": 0,
+        "exact_get_skipped_by_timeout": 0,
+        "exact_get_skipped_by_exact_cap": 0,
+        "exact_post_eligible": 0,
+        "exact_post_scheduled": 0,
+        "exact_post_attempted": 0,
+        "exact_post_completed": 0,
+        "exact_post_empty_body_eligible": 0,
+        "exact_post_empty_body_scheduled": 0,
+        "exact_post_empty_body_attempted": 0,
+        "exact_post_empty_body_completed": 0,
+        "exact_post_bound_body_eligible": 0,
+        "exact_post_bound_body_scheduled": 0,
+        "exact_post_bound_body_attempted": 0,
+        "exact_post_bound_body_completed": 0,
+        "exact_post_skipped_by_request_budget": 0,
+        "exact_post_skipped_by_timeout": 0,
+        "exact_post_skipped_by_exact_cap": 0,
         "skipped_by_safety": {},
         "skipped_by_request_budget": 0,
         "skipped_by_timeout": 0,
@@ -314,7 +350,11 @@ API_COVERAGE_SAFETY_REASONS = frozenset({
 })
 API_COVERAGE_INCOMPLETE_REASONS = frozenset({
     "exact_api_max", "max_requests_per_host", "exact_sweep_timeout",
-    "eligible_exact_incomplete", "replay_max_apis",
+    "eligible_exact_incomplete", "replay_max_apis", "exact_post_max",
+    "exact_post_request_budget", "exact_post_timeout",
+    "eligible_exact_post_incomplete", "exact_get_max",
+    "exact_get_request_budget", "exact_get_timeout",
+    "eligible_exact_get_incomplete",
 })
 API_COVERAGE_NUMERIC_FIELDS = tuple(
     key for key, value in _empty_api_coverage_state().items()
@@ -381,6 +421,88 @@ def canonical_api_coverage(value):
         raise ValueError("api_coverage exact outcomes exceed scheduled work")
     if out["heuristic_attempted"] > out["heuristic_scheduled"]:
         raise ValueError("api_coverage heuristic counts are inconsistent")
+    if not (
+        out["exact_get_completed"] <= out["exact_get_attempted"]
+        <= out["exact_get_scheduled"] <= out["exact_get_eligible"]
+        <= out["independently_exact_discovered"]
+    ):
+        raise ValueError("api_coverage exact GET counts are inconsistent")
+    if not (
+        out["exact_post_completed"] <= out["exact_post_attempted"]
+        <= out["exact_post_scheduled"] <= out["exact_post_eligible"]
+        <= out["independently_exact_discovered"]
+    ):
+        raise ValueError("api_coverage exact POST counts are inconsistent")
+    for body_kind in ("empty_body", "bound_body"):
+        if not (
+            out[f"exact_post_{body_kind}_completed"]
+            <= out[f"exact_post_{body_kind}_attempted"]
+            <= out[f"exact_post_{body_kind}_scheduled"]
+            <= out[f"exact_post_{body_kind}_eligible"]
+        ):
+            raise ValueError("api_coverage exact POST body counts are inconsistent")
+    for stage in ("eligible", "scheduled", "attempted", "completed"):
+        if (
+            out[f"exact_post_empty_body_{stage}"]
+            + out[f"exact_post_bound_body_{stage}"]
+            != out[f"exact_post_{stage}"]
+        ):
+            raise ValueError("api_coverage exact POST body totals are inconsistent")
+    if (
+        out["exact_post_completed"]
+        + out["exact_post_skipped_by_request_budget"]
+        + out["exact_post_skipped_by_timeout"]
+        > out["exact_post_scheduled"]
+    ):
+        raise ValueError("api_coverage exact POST outcomes exceed scheduled work")
+    if out["exact_post_skipped_by_exact_cap"] > out["exact_post_eligible"]:
+        raise ValueError("api_coverage exact POST cap exceeds eligible work")
+    if out["exact_get_scheduled"] + out["exact_get_skipped_by_exact_cap"] != out["exact_get_eligible"]:
+        raise ValueError("api_coverage exact GET scheduling is inconsistent")
+    if out["exact_post_scheduled"] + out["exact_post_skipped_by_exact_cap"] != out["exact_post_eligible"]:
+        raise ValueError("api_coverage exact POST scheduling is inconsistent")
+    if not (
+        out["exact_get_eligible"] == out["exact_post_eligible"]
+        and out["exact_get_scheduled"] == out["exact_post_scheduled"]
+        and out["exact_get_skipped_by_exact_cap"] == out["exact_post_skipped_by_exact_cap"]
+    ):
+        raise ValueError("api_coverage exact dual-method plans are inconsistent")
+    dual_method_coverage = bool(
+        out["exact_get_eligible"] or out["exact_post_eligible"]
+    )
+    if dual_method_coverage and (
+        out["completed_unique_exact"] > out["exact_get_completed"]
+        or out["completed_unique_exact"] > out["exact_post_completed"]
+    ):
+        raise ValueError("api_coverage exact path completion exceeds method completion")
+    if (
+        out["exact_get_completed"]
+        + out["exact_get_skipped_by_request_budget"]
+        + out["exact_get_skipped_by_timeout"]
+        > out["exact_get_scheduled"]
+    ):
+        raise ValueError("api_coverage exact GET outcomes exceed scheduled work")
+    reason_fields = (
+        ("exact_get_skipped_by_exact_cap", "exact_get_max"),
+        ("exact_get_skipped_by_request_budget", "exact_get_request_budget"),
+        ("exact_get_skipped_by_timeout", "exact_get_timeout"),
+        ("exact_post_skipped_by_exact_cap", "exact_post_max"),
+        ("exact_post_skipped_by_request_budget", "exact_post_request_budget"),
+        ("exact_post_skipped_by_timeout", "exact_post_timeout"),
+    )
+    for field, reason in reason_fields:
+        if bool(out[field]) != (reason in out["incomplete_reasons"]):
+            raise ValueError("api_coverage exact method reason is inconsistent")
+    if (
+        (out["exact_get_eligible"] != out["exact_get_completed"])
+        != ("eligible_exact_get_incomplete" in out["incomplete_reasons"])
+    ):
+        raise ValueError("api_coverage exact GET completeness is inconsistent")
+    if (
+        (out["exact_post_eligible"] != out["exact_post_completed"])
+        != ("eligible_exact_post_incomplete" in out["incomplete_reasons"])
+    ):
+        raise ValueError("api_coverage exact POST completeness is inconsistent")
     if out["replay_exact_scheduled"] > out["replay_exact_discovered"]:
         raise ValueError("api_coverage replay counts are inconsistent")
     if not (
@@ -417,7 +539,10 @@ class ApiCoverageTracker:
     def __init__(self):
         self._states = {}
 
-    def prepare(self, target, exact_apis, replay_exact, safety_skips, cap_skips=0):
+    def prepare(
+        self, target, exact_apis, replay_exact, safety_skips, cap_skips=0,
+        post_body_kinds=None, dual_scheduled_apis=None, post_cap_skips=0,
+    ):
         base = str(target.get("base") or "")
         valid_inventory = len(_canonical_api_list(target.get("apis") or []))
         replay_discovered = _coverage_nonnegative_int(
@@ -427,14 +552,45 @@ class ApiCoverageTracker:
             target.get("replay_skipped_by_cap", 0), "replay_skipped_by_cap"
         )
         cap_skips = _coverage_nonnegative_int(cap_skips, "skipped_by_exact_cap")
+        post_cap_skips = _coverage_nonnegative_int(
+            post_cap_skips, "exact_post_skipped_by_exact_cap"
+        )
+        exact_set = set(exact_apis)
+        canonical_post_kinds = {}
+        if post_body_kinds is not None:
+            if not isinstance(post_body_kinds, dict):
+                raise ValueError("post_body_kinds must be a mapping")
+            for api, body_kind in post_body_kinds.items():
+                clean = _canonical_api_path(api, preserve_query=False)
+                if clean in exact_set and body_kind in ("empty", "bound"):
+                    canonical_post_kinds[clean] = body_kind
+        dual_scheduled = {
+            clean for clean in (
+                _canonical_api_path(api, preserve_query=False)
+                for api in (dual_scheduled_apis or [])
+            ) if clean in canonical_post_kinds
+        }
         with API_COVERAGE_LOCK:
             state = _empty_api_coverage_state(valid_inventory)
             state.update({
-                "_exact": set(exact_apis),
-                "_eligible": set(exact_apis) - set(safety_skips),
+                "_exact": exact_set,
+                "_eligible": exact_set - set(safety_skips),
                 "_scheduled_exact": set(),
                 "_attempted_exact": set(),
                 "_completed_exact": set(),
+                "_post_body_kinds": canonical_post_kinds,
+                "_get_eligible": set(canonical_post_kinds),
+                "_scheduled_get": set(dual_scheduled),
+                "_attempted_get": set(),
+                "_completed_get": set(),
+                "_get_budget": set(),
+                "_get_timeout": set(),
+                "_post_eligible": set(canonical_post_kinds),
+                "_scheduled_post": set(dual_scheduled),
+                "_attempted_post": set(),
+                "_completed_post": set(),
+                "_post_budget": set(),
+                "_post_timeout": set(),
                 "_scheduled_heuristic": set(),
                 "_attempted_heuristic": set(),
                 "_replay": set(replay_exact),
@@ -452,6 +608,8 @@ class ApiCoverageTracker:
                 counts[reason] = counts.get(reason, 0) + 1
             state["skipped_by_safety"] = counts
             state["skipped_by_exact_cap"] = cap_skips
+            state["exact_get_skipped_by_exact_cap"] = post_cap_skips
+            state["exact_post_skipped_by_exact_cap"] = post_cap_skips
             state["replay_skipped_by_cap"] = replay_skipped
             self._states[base] = state
 
@@ -470,7 +628,24 @@ class ApiCoverageTracker:
             elif kind == "heuristic":
                 state["_scheduled_heuristic"].add(clean)
 
-    def mark_attempted(self, base, api, kind):
+    def mark_post_scheduled(self, base, api, body_kind):
+        clean = _canonical_api_path(api, preserve_query=False)
+        with API_COVERAGE_LOCK:
+            state = self._states.get(str(base or ""))
+            if (
+                state and clean in state["_post_eligible"]
+                and state["_post_body_kinds"].get(clean) == body_kind
+            ):
+                state["_scheduled_post"].add(clean)
+
+    def mark_get_scheduled(self, base, api):
+        clean = _canonical_api_path(api, preserve_query=False)
+        with API_COVERAGE_LOCK:
+            state = self._states.get(str(base or ""))
+            if state and clean in state["_get_eligible"]:
+                state["_scheduled_get"].add(clean)
+
+    def mark_attempted(self, base, api, kind, method="", body_kind=""):
         clean = _canonical_api_path(api, preserve_query=False)
         if not clean:
             return
@@ -482,6 +657,11 @@ class ApiCoverageTracker:
                 state["_attempted_exact"].add(clean)
                 if clean in state["_replay"]:
                     state["_attempted_replay"].add(clean)
+                if str(method or "").lower() == "post" and clean in state["_scheduled_post"]:
+                    if state["_post_body_kinds"].get(clean) == body_kind:
+                        state["_attempted_post"].add(clean)
+                elif str(method or "").lower() == "get" and clean in state["_scheduled_get"]:
+                    state["_attempted_get"].add(clean)
             elif kind == "heuristic":
                 state["_attempted_heuristic"].add(clean)
 
@@ -490,16 +670,35 @@ class ApiCoverageTracker:
         with API_COVERAGE_LOCK:
             state = self._states.get(str(base or ""))
             if state and clean and clean in state["_attempted_exact"]:
-                state["_completed_exact"].add(clean)
-                if clean in state["_replay"]:
-                    state["_completed_replay"].add(clean)
+                if clean in state["_attempted_get"]:
+                    state["_completed_get"].add(clean)
+                if clean in state["_attempted_post"]:
+                    state["_completed_post"].add(clean)
+                dual_required = clean in state["_get_eligible"] or clean in state["_post_eligible"]
+                dual_complete = (
+                    clean in state["_attempted_get"] and clean in state["_attempted_post"]
+                )
+                if not dual_required or dual_complete:
+                    state["_completed_exact"].add(clean)
+                    if clean in state["_replay"]:
+                        state["_completed_replay"].add(clean)
 
-    def mark_budget(self, base, api):
+    def mark_budget(self, base, api, method=""):
         clean = _canonical_api_path(api, preserve_query=False)
         with API_COVERAGE_LOCK:
             state = self._states.get(str(base or ""))
             if state and clean and clean in state["_eligible"] and clean not in state["_attempted_exact"]:
                 state["_budget"].add(clean)
+            if (
+                state and str(method or "").lower() == "post"
+                and clean in state["_scheduled_post"] and clean not in state["_attempted_post"]
+            ):
+                state["_post_budget"].add(clean)
+            if (
+                state and str(method or "").lower() == "get"
+                and clean in state["_scheduled_get"] and clean not in state["_attempted_get"]
+            ):
+                state["_get_budget"].add(clean)
 
     def mark_timeout(self, base, api):
         clean = _canonical_api_path(api, preserve_query=False)
@@ -511,6 +710,40 @@ class ApiCoverageTracker:
                 and clean not in state["_budget"]
             ):
                 state["_timeout"].add(clean)
+            if (
+                state and clean in state["_scheduled_post"]
+                and clean not in state["_completed_post"]
+                and clean not in state["_attempted_post"]
+                and clean not in state["_post_budget"]
+            ):
+                state["_post_timeout"].add(clean)
+            if (
+                state and clean in state["_scheduled_get"]
+                and clean not in state["_completed_get"]
+                and clean not in state["_attempted_get"]
+                and clean not in state["_get_budget"]
+            ):
+                state["_get_timeout"].add(clean)
+
+    def mark_method_timeout(self, base, api, method):
+        clean = _canonical_api_path(api, preserve_query=False)
+        with API_COVERAGE_LOCK:
+            state = self._states.get(str(base or ""))
+            lower = str(method or "").lower()
+            if lower == "post" and (
+                state and clean in state["_scheduled_post"]
+                and clean not in state["_completed_post"]
+                and clean not in state["_attempted_post"]
+                and clean not in state["_post_budget"]
+            ):
+                state["_post_timeout"].add(clean)
+            if lower == "get" and (
+                state and clean in state["_scheduled_get"]
+                and clean not in state["_completed_get"]
+                and clean not in state["_attempted_get"]
+                and clean not in state["_get_budget"]
+            ):
+                state["_get_timeout"].add(clean)
 
     def snapshot(self, base):
         with API_COVERAGE_LOCK:
@@ -524,6 +757,16 @@ class ApiCoverageTracker:
                 "scheduled_unique_exact": len(state["_scheduled_exact"]),
                 "attempted_unique_exact": len(state["_attempted_exact"]),
                 "completed_unique_exact": len(state["_completed_exact"]),
+                "exact_get_eligible": len(state["_get_eligible"]),
+                "exact_get_scheduled": len(state["_scheduled_get"]),
+                "exact_get_attempted": len(state["_attempted_get"]),
+                "exact_get_completed": len(state["_completed_get"]),
+                "exact_get_skipped_by_request_budget": len(state["_get_budget"]),
+                "exact_get_skipped_by_timeout": len(state["_get_timeout"]),
+                "exact_post_eligible": len(state["_post_eligible"]),
+                "exact_post_scheduled": len(state["_scheduled_post"]),
+                "exact_post_attempted": len(state["_attempted_post"]),
+                "exact_post_completed": len(state["_completed_post"]),
                 "skipped_by_request_budget": len(state["_budget"]),
                 "skipped_by_timeout": len(state["_timeout"]),
                 "replay_exact_discovered": int(state["_replay_discovered_count"]),
@@ -533,6 +776,17 @@ class ApiCoverageTracker:
                 "heuristic_scheduled": len(state["_scheduled_heuristic"]),
                 "heuristic_attempted": len(state["_attempted_heuristic"]),
             })
+            for body_kind, field_kind in (("empty", "empty_body"), ("bound", "bound_body")):
+                eligible = {
+                    api for api, kind in state["_post_body_kinds"].items()
+                    if kind == body_kind
+                }
+                out[f"exact_post_{field_kind}_eligible"] = len(eligible)
+                out[f"exact_post_{field_kind}_scheduled"] = len(eligible & state["_scheduled_post"])
+                out[f"exact_post_{field_kind}_attempted"] = len(eligible & state["_attempted_post"])
+                out[f"exact_post_{field_kind}_completed"] = len(eligible & state["_completed_post"])
+            out["exact_post_skipped_by_request_budget"] = len(state["_post_budget"])
+            out["exact_post_skipped_by_timeout"] = len(state["_post_timeout"])
             reasons = []
             if out["skipped_by_exact_cap"]:
                 reasons.append("exact_api_max")
@@ -544,6 +798,22 @@ class ApiCoverageTracker:
                 reasons.append("replay_max_apis")
             if out["safe_eligible_exact"] != out["completed_unique_exact"]:
                 reasons.append("eligible_exact_incomplete")
+            if out["exact_get_skipped_by_exact_cap"]:
+                reasons.append("exact_get_max")
+            if out["exact_get_skipped_by_request_budget"]:
+                reasons.append("exact_get_request_budget")
+            if out["exact_get_skipped_by_timeout"]:
+                reasons.append("exact_get_timeout")
+            if out["exact_get_eligible"] != out["exact_get_completed"]:
+                reasons.append("eligible_exact_get_incomplete")
+            if out["exact_post_skipped_by_exact_cap"]:
+                reasons.append("exact_post_max")
+            if out["exact_post_skipped_by_request_budget"]:
+                reasons.append("exact_post_request_budget")
+            if out["exact_post_skipped_by_timeout"]:
+                reasons.append("exact_post_timeout")
+            if out["exact_post_eligible"] != out["exact_post_completed"]:
+                reasons.append("eligible_exact_post_incomplete")
             out["incomplete_reasons"] = sorted(set(reasons))
             out["coverage_complete"] = not out["incomplete_reasons"]
             return canonical_api_coverage(out)
@@ -2150,6 +2420,16 @@ def add_seed(profile, value, file_hint=False):
 def merge_param_profiles(dst, src):
     clean_dst = _canonical_param_profile(dst)
     clean_src = _canonical_param_profile(src)
+    dst_blocked = set(clean_dst.get("api_param_blocked") or ())
+    src_blocked = set(clean_src.get("api_param_blocked") or ())
+    independently_bound = {
+        path for path, names in clean_dst.get("api_params", {}).items()
+        if names and path not in dst_blocked
+    }
+    independently_bound.update(
+        path for path, names in clean_src.get("api_params", {}).items()
+        if names and path not in src_blocked
+    )
     dst.clear()
     dst.update(clean_dst)
     src = clean_src
@@ -2185,9 +2465,7 @@ def merge_param_profiles(dst, src):
     for api in src.get("_apis_from_params", set()):
         dst.setdefault("_apis_from_params", set()).add(api)
     dst.setdefault("api_param_blocked", set()).update(src.get("api_param_blocked", set()))
-    dst["api_param_blocked"].difference_update(
-        path for path, names in dst.get("api_params", {}).items() if names
-    )
+    dst["api_param_blocked"].difference_update(independently_bound)
     return dst
 
 def extract_param_profile(content):
@@ -2553,7 +2831,154 @@ def body_param_payloads(path, profile, body_type, allow_param_probe=True):
             break
     return payloads
 
-def request_variants(path, method, content_type, body_func, param_profile=None, allow_param_probe=True):
+
+def exact_path_local_query_suffix(path, profile):
+    """Build one deterministic query using only exact path-local query facts."""
+    profile = profile or {}
+    if exact_path_params_blocked(profile, path):
+        return ""
+    specs = bound_param_specs_by_source(profile, path, "query")
+    spec_by_name = {}
+    for spec in specs:
+        name = normalize_param_name(str(spec.get("name") or "").split(".")[-1].replace("[]", ""))
+        if name:
+            spec_by_name[name] = spec
+    body_names = set(bound_param_names_by_source(profile, path, "json"))
+    body_names.update(bound_param_names_by_source(profile, path, "form"))
+    path_names = set(bound_param_names_by_source(profile, path, "path"))
+    untyped_path_local = set(bound_param_names(profile, path)) - body_names - path_names
+    names = (
+        set(bound_param_names_by_source(profile, path, "query"))
+        | untyped_path_local
+        | set(spec_by_name)
+    )
+    parts = []
+    for name in sorted(names)[:10]:
+        value = param_spec_seed_value(spec_by_name.get(name, {}), name, ("1",))
+        if value is not None:
+            parts.append((name, value))
+    return "?" + urlencode(parts) if parts else ""
+
+
+def _merge_missing_payload(target, source):
+    for key in sorted(source or {}):
+        if key not in target:
+            target[key] = copy.deepcopy(source[key])
+
+
+def _encode_exact_json(payload):
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _encode_exact_form(payload):
+    return urlencode(sorted((str(key), str(value)) for key, value in payload.items())).encode()
+
+
+def _encode_exact_empty(_payload):
+    return b""
+
+
+def exact_path_params_blocked(profile, path):
+    clean = _validated_profile_api_path(path)
+    return bool(
+        clean and clean in _set_like_values((profile or {}).get("api_param_blocked"))
+    )
+
+
+def exact_post_body_opportunity(profile, path):
+    """Return one bounded POST body opportunity using path-local facts only."""
+    if is_file_endpoint(path):
+        return {
+            "body_kind": "empty",
+            "content_type": None,
+            "body_func": _encode_exact_empty,
+            "payload": {},
+        }
+    profile = profile or {}
+    if exact_path_params_blocked(profile, path):
+        return {
+            "body_kind": "empty",
+            "content_type": None,
+            "body_func": _encode_exact_empty,
+            "payload": {},
+        }
+    documented = api_content_types_for(profile, path)
+    for source in ("json", "form"):
+        specs = bound_param_specs_by_source(profile, path, source)
+        names = bound_param_names_by_source(profile, path, source)
+        shapes = bound_param_shapes_by_source(profile, path, source)
+        if not (specs or names or shapes):
+            continue
+        if source == "json":
+            payload = build_spec_payload(specs, ("1",), max_fields=10)
+            _merge_missing_payload(payload, build_nested_payload(shapes, ("1",)))
+            for name in sorted(names)[:10]:
+                payload.setdefault(name, param_seed_value(name, ("1",)))
+            matching = sorted(value for value in documented if is_json_content_type(value))
+            content_type = matching[0] if matching else "application/json"
+            encoder = _encode_exact_json
+        else:
+            spec_by_name = {}
+            for spec in specs:
+                name = normalize_param_name(str(spec.get("name") or "").split(".")[-1].replace("[]", ""))
+                if name:
+                    spec_by_name[name] = spec
+            flat_names = set(names) | set(spec_by_name)
+            for children in shapes.values():
+                flat_names.update(children)
+            payload = {
+                name: param_spec_seed_value(spec_by_name.get(name, {}), name, ("1",))
+                for name in sorted(flat_names)[:10]
+            }
+            payload = {key: value for key, value in payload.items() if value is not None}
+            matching = sorted(value for value in documented if is_urlencoded_content_type(value))
+            content_type = matching[0] if matching else "application/x-www-form-urlencoded"
+            encoder = _encode_exact_form
+        if payload:
+            return {
+                "body_kind": "bound",
+                "content_type": content_type,
+                "body_func": encoder,
+                "payload": payload,
+            }
+    return {
+        "body_kind": "empty",
+        "content_type": None,
+        "body_func": _encode_exact_empty,
+        "payload": {},
+    }
+
+
+def exact_post_body_kind(profile, path):
+    return exact_post_body_opportunity(profile, path)["body_kind"]
+
+
+def exact_dual_method_bypass_tests(profile, path, get_tests=None):
+    get_test = next(
+        (
+            item for item in (get_tests or [])
+            if str(item[1] or "GET").upper() == "GET" and not item[4]
+        ),
+        ("GET_no_auth", "GET", None, None, {}),
+    )
+    post = exact_post_body_opportunity(profile, path)
+    post_name = "POST_EXACT_BOUND_no_auth" if post["body_kind"] == "bound" else "POST_EXACT_EMPTY_no_auth"
+    return [
+        get_test,
+        (post_name, "POST", post["content_type"], post["body_func"], {}),
+    ]
+
+
+def request_variants(
+    path, method, content_type, body_func, param_profile=None,
+    allow_param_probe=True, exact_dual_method=False,
+):
+    if exact_dual_method:
+        query_suffix = exact_path_local_query_suffix(path, param_profile or {})
+        if str(method or "GET").upper() == "POST":
+            opportunity = exact_post_body_opportunity(param_profile or {}, path)
+            return [(query_suffix, copy.deepcopy(opportunity["payload"]))]
+        return [(query_suffix, None)]
     if method in ("POST", "PUT", "PATCH") and body_func:
         body_type = "form" if is_urlencoded_content_type(content_type) else "json"
         profile = param_profile or {}
@@ -2609,7 +3034,9 @@ def is_action_like_post_path(path):
     lowered = "/" + "/".join(words)
     return any(hint in words or hint in lowered for hint in ACTIVE_POST_HINTS)
 
-def scheduled_bypass_tests(path, bypass_tests, param_profile=None):
+def scheduled_bypass_tests(
+    path, bypass_tests, param_profile=None, exact_dual_method=False,
+):
     """Filter probe methods by observed API method metadata.
 
     Unknown endpoints are probed with GET only.  POST is only sent when it was
@@ -2617,6 +3044,15 @@ def scheduled_bypass_tests(path, bypass_tests, param_profile=None):
     active POST probing with --allow-active-post.  DELETE-only paths are not
     probed by default even if a literal path escaped into the inventory.
     """
+    if exact_dual_method:
+        out, seen_methods = [], set()
+        for item in bypass_tests or []:
+            upper = str(item[1] or "GET").upper()
+            if upper not in ("GET", "POST") or upper in seen_methods:
+                continue
+            seen_methods.add(upper)
+            out.append(item)
+        return out
     methods = api_methods_for(param_profile, path)
     # --include-delete-method is an inventory/extraction opt-in only.  A
     # DELETE-only endpoint must not be actively probed with GET or DELETE by the
@@ -3222,7 +3658,8 @@ def _exact_api_sweep_plan_scoped(api_results, max_per_target=0, tracker=None):
                     api,
                 ),
             )
-            safety_skips = {
+            dual_method = bool(getattr(args, "post_every_api", False))
+            safety_skips = {} if dual_method else {
                 api: reason for api in exact
                 for reason in (exact_api_safety_reason(target, api),) if reason
             }
@@ -3232,7 +3669,16 @@ def _exact_api_sweep_plan_scoped(api_results, max_per_target=0, tracker=None):
                 cap_skips = len(eligible) - max_per_target
                 eligible = eligible[:max_per_target]
             if tracker:
-                tracker.prepare(target, exact, replay & set(exact), safety_skips, cap_skips=cap_skips)
+                post_body_kinds = {
+                    api: exact_post_body_kind(target.get("param_profile"), api)
+                    for api in exact
+                } if dual_method else {}
+                tracker.prepare(
+                    target, exact, replay & set(exact), safety_skips,
+                    cap_skips=cap_skips, post_body_kinds=post_body_kinds,
+                    dual_scheduled_apis=eligible if dual_method else (),
+                    post_cap_skips=cap_skips if dual_method else 0,
+                )
             per_target.append([(target, api) for api in eligible])
     tasks = []
     index = 0
@@ -4815,6 +5261,7 @@ def test_api(
     coverage_tracker=None,
     coverage_kind="",
     opportunity_ledger=None,
+    exact_dual_method=False,
 ):
     raw_path = str(path or "")
     path_identity = raw_path.split("?", 1)[0].split("#", 1)[0]
@@ -4824,6 +5271,11 @@ def test_api(
     clean = validated_path.rstrip("/")
     if not clean and validated_path.startswith("/"):
         clean = "/"
+    exact_dual_method = bool(
+        exact_dual_method
+        and coverage_kind == "exact"
+        and getattr(args, "post_every_api", False)
+    )
     try:
         url_base = urljoin(base_url, clean)
     except (TypeError, ValueError):
@@ -4831,32 +5283,47 @@ def test_api(
     base_origin = _exact_http_origin_key(base_url)
     if not base_origin or _exact_http_origin_key(url_base) != base_origin:
         return []
-    bypass_tests = scheduled_bypass_tests(clean, bypass_tests, param_profile)
+    bypass_tests = scheduled_bypass_tests(
+        clean, bypass_tests, param_profile, exact_dual_method=exact_dual_method,
+    )
     if not bypass_tests:
         return []
     findings = []
     opportunity_ledger = opportunity_ledger or ACTIVE_PHASE3_OPPORTUNITY_LEDGER
     for name, method, ct, bf, headers in bypass_tests:
-        variants = [("", None)] if single_variant else request_variants(
-            clean, method, ct, bf, param_profile, allow_param_probe=allow_param_probe
+        upper_method = str(method or "GET").upper()
+        variants = [("", None)] if single_variant and not exact_dual_method else request_variants(
+            clean, method, ct, bf, param_profile,
+            allow_param_probe=allow_param_probe,
+            exact_dual_method=exact_dual_method,
         )
         for qs, payload in variants:
+            body_kind = ""
+            if exact_dual_method and upper_method == "POST":
+                body_kind = exact_post_body_kind(param_profile, clean)
             probe_mode = phase3_probe_mode(method, ct, headers, qs, payload)
             if (
-                coverage_kind != "exact"
+                (coverage_kind != "exact" or exact_dual_method)
                 and opportunity_ledger.exact_mode_attempted(base_url, clean, probe_mode)
             ):
                 continue
             if phase3_task_cancelled():
+                if coverage_tracker and coverage_kind == "exact" and exact_dual_method:
+                    coverage_tracker.mark_method_timeout(base_url, clean, upper_method)
+                    if upper_method == "GET":
+                        coverage_tracker.mark_method_timeout(base_url, clean, "POST")
                 return findings
             url = url_base + qs
             try:
                 data = None
-                if method in ("POST","PUT","PATCH") and bf:
-                    data = bf(payload or {"page":"1","size":"10"})
+                if exact_dual_method and upper_method == "POST" and body_kind == "empty":
+                    data = None
+                elif upper_method in ("POST", "PUT", "PATCH") and bf:
+                    body_payload = payload if payload is not None else {"page": "1", "size": "10"}
+                    data = bf(body_payload)
                 h = {"User-Agent":"Mozilla/5.0","Accept":"application/json","Accept-Encoding":http_accept_encoding()}
                 h.update(headers)
-                if data and ct: h["Content-Type"] = ct
+                if data is not None and ct: h["Content-Type"] = ct
                 catch_all_baseline, catch_all_probe_hold = get_catch_all_baseline(
                     base_url, clean, method, h, data, scope_override=catch_all_scope
                 )
@@ -4867,12 +5334,21 @@ def test_api(
                 allowed, limit_reason = acquire_phase3_request_slot(url, consume_probe_hold=bool(catch_all_probe_hold))
                 if not allowed:
                     release_catch_all_control_budget(catch_all_probe_hold, controls=0, release_probe=True)
+                    if limit_reason == "task_pool_timeout":
+                        if coverage_tracker and coverage_kind == "exact" and exact_dual_method:
+                            coverage_tracker.mark_method_timeout(base_url, clean, upper_method)
+                            if upper_method == "GET":
+                                coverage_tracker.mark_method_timeout(base_url, clean, "POST")
+                        return findings
                     if coverage_tracker and coverage_kind == "exact" and limit_reason == "max_requests_per_host":
-                        coverage_tracker.mark_budget(base_url, clean)
+                        coverage_tracker.mark_budget(base_url, clean, method=upper_method)
                     log.debug(f"Phase3 request skipped for {url}: {limit_reason}")
                     continue
                 if coverage_tracker and coverage_kind:
-                    coverage_tracker.mark_attempted(base_url, clean, coverage_kind)
+                    coverage_tracker.mark_attempted(
+                        base_url, clean, coverage_kind,
+                        method=upper_method, body_kind=body_kind,
+                    )
                 if coverage_kind == "exact":
                     opportunity_ledger.mark_exact_attempted(base_url, clean, probe_mode)
                 req = Request(url, data=data, headers=h, method=method)
@@ -5475,7 +5951,6 @@ def _canonical_param_profile(profile):
             for value in _profile_string_set(profile.get("api_param_blocked"))
         ) if clean
     }
-    out["api_param_blocked"].difference_update(out["api_params"])
     return out
 
 
@@ -6163,6 +6638,7 @@ def carry_replay_param_profile(dst_target, src_target, api, src_index=None):
     copied = False
 
     dst_api_params = _ensure_mapping_field(dst, "api_params")
+    had_destination_params = bool(_set_like_values(dst_api_params.get(clean)))
     for names in _profile_path_values(src.get("api_params"), clean):
         names = _set_like_values(names)
         if names:
@@ -6239,7 +6715,7 @@ def carry_replay_param_profile(dst_target, src_target, api, src_index=None):
     dst_blocked = _ensure_set_field(dst, "api_param_blocked")
     has_destination_params = bool(_set_like_values(dst_api_params.get(clean)))
     profile_mutated = False
-    if clean in src_blocked and not has_destination_params:
+    if clean in src_blocked and not had_destination_params:
         dst_blocked.add(clean)
         copied = True
     elif has_destination_params and clean in dst_blocked:
@@ -6984,6 +7460,8 @@ def main():
     # Phase 3: 两阶段测试
     phase3_mode = "FULL绕过+全变体" if args.collect_all_variants else "FULL绕过+命中断路" if args.full_bypass else "FAST绕过+命中断路"
     print(f"\n[Phase 3] 未授权测试 ({phase3_mode})...")
+    if bool(getattr(args, "post_every_api", False)):
+        print("  WARNING: --post-every-api authorized; each independently exact API gets one GET and one POST opportunity")
     target_map = {}
     for t in api_results:
         target_map[t["base"]] = t; t["_f"] = []
@@ -6997,25 +7475,38 @@ def main():
     )
     for target, api in exact_tasks:
         coverage_tracker.mark_scheduled(target["base"], api, "exact")
+        if bool(getattr(args, "post_every_api", False)):
+            coverage_tracker.mark_get_scheduled(target["base"], api)
+            coverage_tracker.mark_post_scheduled(
+                target["base"], api,
+                exact_post_body_kind(target.get("param_profile"), api),
+            )
     print(f"  3a/exact: {len(exact_tasks)} independently exact safe tasks")
     if exact_tasks:
         t_start = time.time()
         def test_exact(task):
             target, api = task
             profile = target.get("param_profile")
-            single_variant = not has_bound_params(profile, api) and not is_file_endpoint(api)
-            tests = list(bypass_used)
-            for extra in body_probe_bypass_tests(profile, api):
-                if not any(existing[:3] == extra[:3] for existing in tests):
-                    tests.append(extra)
+            dual_method = bool(getattr(args, "post_every_api", False))
+            single_variant = False if dual_method else (
+                not has_bound_params(profile, api) and not is_file_endpoint(api)
+            )
+            if dual_method:
+                tests = exact_dual_method_bypass_tests(profile, api, bypass_used)
+            else:
+                tests = list(bypass_used)
+                for extra in body_probe_bypass_tests(profile, api):
+                    if not any(existing[:3] == extra[:3] for existing in tests):
+                        tests.append(extra)
             findings = test_api(
                 target["base"], api, tests,
-                short_circuit=not args.collect_all_variants,
+                short_circuit=False if dual_method else not args.collect_all_variants,
                 param_profile=profile,
                 allow_param_probe=True,
                 single_variant=single_variant,
                 coverage_tracker=coverage_tracker,
                 coverage_kind="exact",
+                exact_dual_method=dual_method,
             )
             return target["base"], api, findings
         def handle_exact(result):
@@ -7362,6 +7853,12 @@ def main():
         f"- scheduled_unique_exact: {api_coverage['scheduled_unique_exact']}\n"
         f"- attempted_unique_exact: {api_coverage['attempted_unique_exact']}\n"
         f"- completed_unique_exact: {api_coverage['completed_unique_exact']}\n"
+        f"- exact_get_eligible/scheduled/attempted/completed: {api_coverage['exact_get_eligible']}/{api_coverage['exact_get_scheduled']}/{api_coverage['exact_get_attempted']}/{api_coverage['exact_get_completed']}\n"
+        f"- exact_get_skipped budget/timeout/cap: {api_coverage['exact_get_skipped_by_request_budget']}/{api_coverage['exact_get_skipped_by_timeout']}/{api_coverage['exact_get_skipped_by_exact_cap']}\n"
+        f"- exact_post_eligible/scheduled/attempted/completed: {api_coverage['exact_post_eligible']}/{api_coverage['exact_post_scheduled']}/{api_coverage['exact_post_attempted']}/{api_coverage['exact_post_completed']}\n"
+        f"- exact_post_empty_body eligible/scheduled/attempted/completed: {api_coverage['exact_post_empty_body_eligible']}/{api_coverage['exact_post_empty_body_scheduled']}/{api_coverage['exact_post_empty_body_attempted']}/{api_coverage['exact_post_empty_body_completed']}\n"
+        f"- exact_post_bound_body eligible/scheduled/attempted/completed: {api_coverage['exact_post_bound_body_eligible']}/{api_coverage['exact_post_bound_body_scheduled']}/{api_coverage['exact_post_bound_body_attempted']}/{api_coverage['exact_post_bound_body_completed']}\n"
+        f"- exact_post_skipped budget/timeout/cap: {api_coverage['exact_post_skipped_by_request_budget']}/{api_coverage['exact_post_skipped_by_timeout']}/{api_coverage['exact_post_skipped_by_exact_cap']}\n"
         f"- skipped_by_safety: {json.dumps(api_coverage['skipped_by_safety'], ensure_ascii=False, sort_keys=True)}\n"
         f"- skipped_by_request_budget: {api_coverage['skipped_by_request_budget']}\n"
         f"- skipped_by_timeout: {api_coverage['skipped_by_timeout']}\n"

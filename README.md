@@ -137,6 +137,7 @@ python3 tests/v13_post_body_lab.py
 | `--phase3a-timeout` | 240 | Phase 3a 快筛软超时, 超时后先进入候选/补筛流程 |
 | `--exact-api-max` | 0 | 每目标独立精确来源 API 的安全首扫上限;0=不限制 |
 | `--exact-sweep-timeout` | 0 | 全量精确 API 首扫软超时;0=不限制且不受 `--phase3a-timeout` 影响 |
+| `--post-every-api` | false | **高风险显式授权**: 每条独立精确 API 除一次 GET 外再发送一次 POST；只使用 path-local query/body 事实；file/upload-like 路径是参数传播的显式例外，POST 始终为空；不授权 PUT/PATCH/DELETE 或文件上传 |
 | `--rescue-timeout` | 180 | Phase 3a baseline 补筛软超时 |
 | `--disable-rescue-baseline` | false | 关闭 Phase 3a baseline 补筛 |
 | `--phase3b-layer-timeout` | 300 | Phase 3b 每个分层的软超时 |
@@ -254,6 +255,8 @@ python3 pipeline/deep_scanner.py \
 | POST_JWT_none | JWT `alg: none` 绕过 | `--full-bypass` |
 
 > **注意**: 默认模式下第一个有价值命中后立即短路。开启 `--full-bypass` 会尝试更多认证绕过方法，但仍然命中断路，适合大批资产争取覆盖率。开启 `--collect-all-variants` 会隐含 `--full-bypass`，并在命中后继续收集所有绕过/参数变体，适合小批目标补证据。
+
+> **双方法授权警告**: `--post-every-api` 默认关闭，只应在已获得明确主动测试授权的范围内使用。开启后，有限 provenance allowlist 中每条 validated independently-exact canonical API 都会获得恰好一次 primary 无认证 GET 和一次 primary 无认证 POST opportunity，即使没有方法证据、路径名称看起来具有动作性或路径本身是 file/upload-like。query/path 参数仍留在 URL/path；普通非文件路径的 JSON/form body 只包含该路径自己的绑定字段，并在有至少一个可用同路径 body 参数时采用受支持 content type。file/upload-like 路径是 bound-parameter propagation 的显式例外：即使存在同路径 JSON/form 名称、schema、shape、Content-Type、文件名、metadata 或 file seed，也只发送真正零长度、无 Content-Type 的 mandatory POST，绝不构造 multipart/file upload。Content-Type 本身不是 body 参数证据；普通路径完全没有可用 body 参数、只有 Content-Type，或路径被 `api_param_blocked` 标记时，同样发送真正零长度、无 Content-Type 的 POST，不伪造分页 JSON、PUT/PATCH/DELETE、全局参数或 seed。GET 与 POST 分别计入 aggregate coverage，任一 obligation 未完成或显式 request/time/cap 截断都会使 coverage 不完整。
 
 普通 API 端点自动尝试 3 种查询后缀: 无参数 / `?page=1&count=10` / `?page=1&size=10`。JS/Swagger/页面里真实出现的疑似文件接口会启用文件专项参数模板。v13 会把 HTML/JS 中提取到的 URL 与参数名绑定，在候选目标的 3b 阶段生成组合参数探测；如果前端请求明确使用 POST JSON body 或表单 body，POST_JSON/POST_FORM 会把绑定参数放进真实请求体，而不是只拼到 query。
 
@@ -411,7 +414,7 @@ name, fileName, key, objectKey, ossKey, resourceId
 - **Exact 不重复调度**: all-exact 首扫已经使用 path-local method/body/param scheduler，因此同一 exact canonical path 不再进入 config-rest、legacy fast、rescue、body-fast、param-rescue、backend、business、file 或 candidate-deep provider，也不占这些启发式池的 4/8/80 等容量。传输边界另有 run-local first-opportunity ledger，按 canonical path + method/content-type/auth mode 记录 exact 实际请求；未来 legacy provider 即使遗漏构造期过滤，也不能重发同一 mode，未由 exact 执行的不同显式 mode 不受影响。启发式路径仍保留原有 deep 流程。
 - **Phase 3a 软截止**: 该截止仅约束后续启发式快筛；快筛尾部慢请求超过 `--phase3a-timeout` 后跳过, 已命中目标先进入 3b, 未命中目标由 baseline FULL 补筛兜底
 - **超时 drain**: 网络任务池软超时后立即关闭新的 Phase 3 request/control slot，取消尚未启动的任务，并等待已在执行的至多一个有界 HTTP 操作退出后再生成 coverage/report。任何已经进入 worker body 并正常返回或失败返回的 invocation 都计入不可变 `TaskPoolStats.completed`，即使它在截止前尚未取得请求槽；只有被取消或从未进入 worker body 的任务计入 `skipped_timeout` 并触发 `on_timeout`。两者互斥且总和不超过 submitted；`deadline_pending` 只是允许与 completed 重叠的截止时诊断数。返回或落盘后不会再有后台 worker 发送请求或修改 finding/coverage。
-- **覆盖口径**: `report.json`、`api_coverage.json` checkpoint 与 `stats.api_coverage` 只保存聚合计数和有限原因，不保存端点样本、query 或正文；无发现目标不会因此生成 finding checkpoint。`scheduled` 表示进入任务队列，`attempted` 仅在真实 API 请求取得请求槽后计数，`completed` 表示至少尝试过且任务已返回。coverage wire 只接受有限字段、有限原因和非负有界整数；畸形 JSONL record 会 fail closed 并继续读取后续记录。显式 replay cap 会产生 `replay_max_apis` 不完整原因。`report.apis` 为兼容保留，仍表示 target/base 记录数；API 清单总量使用 `api_inventory_total`。
+- **覆盖口径**: `report.json`、`api_coverage.json` checkpoint 与 `stats.api_coverage` 只保存聚合计数和有限原因，不保存端点样本、query 或正文；无发现目标不会因此生成 finding checkpoint。`scheduled` 表示进入任务队列，`attempted` 仅在真实 API 请求取得请求槽后计数，`completed` 表示至少尝试过且任务已返回。双方法模式另以 `exact_get_*`、`exact_post_*` 及 empty/bound body 聚合字段独立记账；POST 单独完成不能把 path-level exact 标成 completed。coverage wire 只接受有限字段、有限原因和非负有界整数，并校验 `scheduled + cap_skipped == eligible` 与 method outcome 上限；畸形 JSONL record 会 fail closed 并继续读取后续记录。显式 replay cap 会产生 `replay_max_apis` 不完整原因。`report.apis` 为兼容保留，仍表示 target/base 记录数；API 清单总量使用 `api_inventory_total`。
 - **Metadata/Profile 索引**: 每次顶层 exact 规划、seed/provider 规划或 replay 调用，都对每个 target/record 构建一次不可变的 canonical `api_meta`、source-state 与 confidence 调用级快照，调用内 exact/prefix/replay/priority/provider 查询均为 O(1)。快照从不存入 record，下一次顶层调用会自动观察同长度的原地 metadata 变更。跨 base replay 同样为每个 source profile 一次性 canonicalize 所有 exact path-local maps 与 blocked set，随后逐 path O(1) 查找；profile 快照也只存在于该次 replay 调用并在返回时丢弃，因此下一次调用会观察同 identity/长度的嵌套原地变更。group 内使用原始 source 快照，不递归传播刚 replay 的事实。内部索引不会进入 JSON/JSONL。
 - **全阶段软截止**: baseline 补筛和 3b 各层也有独立软超时, 避免任一阶段尾部慢请求拖死整批
 - **SSL 自签名**: `ssl.CERT_NONE` + 12s 超时 + 3 次重试

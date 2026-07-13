@@ -50,7 +50,7 @@ API_EXTRACT_PATTERNS = [
     # baseURL: "/xxx"
     (re.compile(r'''baseURL\s*:\s*["']([^"']{2,200})["']''', re.I), "baseURL"),
     # .get("/xxx"), .post("/xxx")
-    (re.compile(r'''\.(?:get|post|put|delete|patch)\s*\(\s*["']([^"']{2,200})["']''', re.I), "method"),
+    (re.compile(r'''\.(?:get|post|put|patch)\s*\(\s*["']([^"']{2,200})["']''', re.I), "method"),
     # axios({url: "/xxx"})
     (re.compile(r'''axios\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["']''', re.I), "axios"),
     # fetch("/xxx")
@@ -60,7 +60,7 @@ API_EXTRACT_PATTERNS = [
     # Generic API paths in quotes
     (re.compile(r'''["'](/api/[a-zA-Z][a-zA-Z0-9_/\-.]{2,200})["']''', re.I), "direct_api"),
     # 中文API路径
-    (re.compile(r'''["'](/[a-zA-Z][a-zA-Z0-9_/\-.]{3,200}/(?:list|query|find|get|add|update|delete|save|info|config|user|admin|login|logout|token|auth|server|device|channel|record|platform|role|log|data|push|proxy|group|region|upload|download|file|notary|enterprise|portal|biz|nsc|CmCon|profile|account|setting|manage|dashboard|monitor|stream|video|camera|media)[a-zA-Z0-9_/\-.]{0,100})["']''', re.I), "business"),
+    (re.compile(r'''["'](/[a-zA-Z][a-zA-Z0-9_/\-.]{3,200}/(?:list|query|find|get|add|update|delete|save|info|config|user|admin|login|logout|token|auth|server|device|channel|record|platform|role|log|data|push|proxy|group|region|upload|download|file|notary|enterprise|portal|biz|profile|account|setting|manage|dashboard|monitor|stream|video|camera|media)[a-zA-Z0-9_/\-.]{0,100})["']''', re.I), "business"),
 ]
 
 # 从 extract_api.py 的行383区域继承：需要 POST 的特殊端点
@@ -141,7 +141,7 @@ def extract_apis_from_js(content):
             ext = os.path.splitext(path)[1].lower()
             if ext in ('.js','.css','.png','.jpg','.gif','.svg','.ico','.woff','.woff2','.ttf','.eot','.map','.json','.xml','.html','.pdf'): continue
             # 只保留 API 相关路径
-            if re.search(r'/api/|/user|/admin|/login|/logout|/auth|/token|/server|/system|/device|/channel|/record|/platform|/role|/log|/data|/info|/config|/push|/proxy|/group|/region|/upload|/download|/file|/notary|/enterprise|/portal|/biz|/nsc|/CmCon|/profile|/account|/setting|/manage|/dashboard|/query|/list|/search|/find|/monitor|/stream|/video|/camera|/media|/back/', path, re.I):
+            if re.search(r'/api/|/user|/admin|/login|/logout|/auth|/token|/server|/system|/device|/channel|/record|/platform|/role|/log|/data|/info|/config|/push|/proxy|/group|/region|/upload|/download|/file|/notary|/enterprise|/portal|/biz|/profile|/account|/setting|/manage|/dashboard|/query|/list|/search|/find|/monitor|/stream|/video|/camera|/media|/back/', path, re.I):
                 apis.add(path)
     return apis
 

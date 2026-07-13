@@ -3,7 +3,7 @@
 
 Scenario:
   * The target root is a pure JSON response and exposes no HTML/JS API inventory.
-  * Several high-value /auth/* endpoints are nevertheless reachable unauthenticated.
+  * Several generic synthetic REST endpoints are reachable unauthenticated.
   * Default scanner behavior must stay quiet: the extra backend dictionary is opt-in.
   * With --enable-backend-baseline, Phase 2 inventories and Phase 3 tests those
     endpoints and flags the data/JWT exposures.
@@ -21,33 +21,38 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 SCANNER = ROOT / "pipeline" / "deep_scanner.py"
+QUERY_MARKER = "v28_query_must_not_persist"
+CREDENTIAL_MARKER = "v28_credential_must_not_persist"
 
 BACKEND_DATA = {
-    "/auth/externalInterfaceApi/list": [
-        {"id": "1465", "interfaceName": "syncStudent", "companyId": "9", "status": 1},
+    "/api/v1/status": [
+        {"id": "1465", "serviceName": "synthetic-service", "status": 1},
     ],
-    "/auth/leaveSchool/list": [
-        {"id": "21", "studentName": "masked", "companyId": "9", "leaveStatus": 0},
+    "/api/v1/health": [
+        {"id": "21", "componentName": "synthetic-component", "status": "up"},
     ],
-    "/auth/company/api/getCompanyList": [
-        {"id": "9", "companyName": "demo-company", "companyCode": "demo"},
+    "/api/v1/users": [
+        {"id": "9", "userName": "synthetic-user", "status": "active"},
     ],
-    "/auth/getRandomCode": [
-        "uuid-demo",
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
-    ],
-    "/auth/account/getByOpenid/aaaa": [
+    "/api/v1/search": [
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.signature",
-        "2074034712734646274",
+        "synthetic-record",
     ],
-    "/auth/cameraFile/api/outApiCheckPhotos": [
-        {"photoId": "1", "cameraId": "cam-1", "photoUrl": "https://example.invalid/masked.jpg"},
+    "/rest/status": [
+        {"id": "1", "name": "synthetic-rest", "status": "ready"},
+    ],
+    "/rest/users": [
+        {"id": "1", "userName": "synthetic-rest-user", "status": "active"},
     ],
 }
 
 
 class LabServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def __init__(self, address, handler):
+        super().__init__(address, handler)
+        self.hits = []
 
     @property
     def url(self):
@@ -66,20 +71,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
+    def _handle(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path == "/":
             return self._json({"code": 200, "message": "OK", "result": {"service": "api-only"}})
-        if path == "/auth/cameraFile/api/outApiCheckPhotos":
-            if "photoId=1" in urlparse(self.path).query:
+        if path == "/rest/users":
+            if "id=1" in urlparse(self.path).query:
                 return self._json({"code": 200, "message": "OK", "result": BACKEND_DATA[path]})
             return self._json({"code": 400, "message": "missing parameter", "result": None}, status=400)
         if path in BACKEND_DATA:
             return self._json({"code": 200, "message": "OK", "result": BACKEND_DATA[path]})
         return self._json({"code": 404, "message": "not found"}, status=404)
 
+    def do_GET(self):
+        self.server.hits.append((self.command, urlparse(self.path).path))
+        return self._handle()
+
     def do_POST(self):
-        return self.do_GET()
+        self.server.hits.append((self.command, urlparse(self.path).path))
+        return self._handle()
 
 
 def flatten(report):
@@ -130,8 +140,11 @@ def main():
             wordlist = tmp / "extra_apis.txt"
             wordlist.write_text(
                 "# user supplied backend paths\n"
-                f"{server.url}/auth/externalInterfaceApi/list\n"
-                "/auth/leaveSchool/list\n",
+                f"{server.url}/api/v1/status?probe={QUERY_MARKER}#ignored\n"
+                f"HTTP://127.0.0.1:{server.server_address[1]}/api/v1/users#ignored\n"
+                f"HTTP://user:pass@127.0.0.1:{server.server_address[1]}/{CREDENTIAL_MARKER}\n"
+                f"//127.0.0.1:{server.server_address[1]}/network-path-must-not-persist\n"
+                f"http://127.0.0.1:{server.server_address[1]}//double-slash-must-not-persist\n",
                 encoding="utf-8",
             )
             wordlist_out = tmp / "wordlist"
@@ -149,14 +162,56 @@ def main():
                 "--fresh",
                 "--extra-api-wordlist", str(wordlist),
             ]
+            wordlist_hit_start = len(server.hits)
             proc_wordlist = subprocess.run(cmd, text=True, capture_output=True, timeout=200)
             if proc_wordlist.returncode != 0:
                 print(proc_wordlist.stdout)
                 print(proc_wordlist.stderr)
                 raise SystemExit(proc_wordlist.returncode)
             wordlist_inventory = json.loads((wordlist_out / "phase2_inventory.jsonl").read_text(encoding="utf-8").splitlines()[0])
-            assert wordlist_inventory["api_sources"].get("/auth/externalInterfaceApi/list") == ["extra_wordlist"], wordlist_inventory["api_sources"]
-            assert wordlist_inventory["api_sources"].get("/auth/leaveSchool/list") == ["extra_wordlist"], wordlist_inventory["api_sources"]
+            assert wordlist_inventory["api_sources"].get("/api/v1/status") == ["extra_wordlist"], wordlist_inventory["api_sources"]
+            assert wordlist_inventory["api_sources"].get("/api/v1/users") == ["extra_wordlist"], wordlist_inventory["api_sources"]
+            wordlist_hits = server.hits[wordlist_hit_start:]
+            for path in ("/api/v1/status", "/api/v1/users"):
+                assert ("GET", path) in wordlist_hits, (path, wordlist_hits)
+                assert ("POST", path) not in wordlist_hits, (path, wordlist_hits)
+            wordlist_report = json.loads((wordlist_out / "report.json").read_text(encoding="utf-8"))
+            wordlist_paths = {urlparse(fi.get("url", "")).path for fi in flatten(wordlist_report)}
+            assert {
+                "/api/v1/status", "/api/v1/users",
+            } <= wordlist_paths, wordlist_paths
+
+            dry_out = tmp / "wordlist-dry"
+            dry_cmd = [
+                sys.executable, str(SCANNER),
+                "--input", str(target_file),
+                "--outdir", str(dry_out),
+                "--workers", "4",
+                "--timeout", "3",
+                "--no-proxy",
+                "--skip-port-probe",
+                "--disable-api-fuzz",
+                "--replay-scope", "none",
+                "--dry-run",
+                "--fresh",
+                "--extra-api-wordlist", str(wordlist),
+            ]
+            dry_proc = subprocess.run(dry_cmd, text=True, capture_output=True, timeout=120)
+            if dry_proc.returncode != 0:
+                print(dry_proc.stdout)
+                print(dry_proc.stderr)
+                raise SystemExit(dry_proc.returncode)
+            for name in ("phase2_full.jsonl", "phase2_inventory.jsonl", "apis.json"):
+                persisted = (dry_out / name).read_text(encoding="utf-8")
+                assert QUERY_MARKER not in persisted, name
+                assert CREDENTIAL_MARKER not in persisted, name
+                assert "network-path-must-not-persist" not in persisted, name
+                assert "double-slash-must-not-persist" not in persisted, name
+            dry_inventory = json.loads((dry_out / "phase2_inventory.jsonl").read_text().splitlines()[0])
+            for path in ("/api/v1/status", "/api/v1/users"):
+                assert path in dry_inventory["apis"], (path, dry_inventory["apis"])
+                assert not any(api.startswith(path + "?") for api in dry_inventory["apis"]), dry_inventory["apis"]
+                assert dry_inventory["api_sources"].get(path) == ["extra_wordlist"]
 
             opt_in_out = tmp / "opt-in"
             proc = run_scan(target_file, opt_in_out, enable_backend_baseline=True)
@@ -174,7 +229,7 @@ def main():
             assert expected_hits.issubset(paths), f"missing hits: {expected_hits - paths}; got={paths}"
             jwt_finding = [
                 fi for fi in flatten(report)
-                if urlparse(fi.get("url", "")).path == "/auth/account/getByOpenid/aaaa"
+                if urlparse(fi.get("url", "")).path == "/api/v1/search"
             ]
             assert jwt_finding and jwt_finding[0].get("credential_leak"), jwt_finding
             print("BACKEND BASELINE LAB PASS")

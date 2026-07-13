@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dedup/auth-filter lab for full-bypass report noise."""
 
-import json, subprocess, sys, tempfile, threading
+import json, os, stat, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -82,6 +82,16 @@ def flatten(report):
     return [fi for host in report.get("findings", []) for fi in host.get("findings", [])]
 
 
+def assert_no_key_recursive(obj, forbidden):
+    if isinstance(obj, dict):
+        assert forbidden not in obj, f"{forbidden} should be redacted from report: {obj}"
+        for value in obj.values():
+            assert_no_key_recursive(value, forbidden)
+    elif isinstance(obj, list):
+        for item in obj:
+            assert_no_key_recursive(item, forbidden)
+
+
 def main():
     server = LabServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -90,6 +100,10 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             target_file = Path(tmp) / "targets.json"
             outdir = Path(tmp) / "out"
+            stale_evidence_dir = outdir / "evidence"
+            stale_evidence_dir.mkdir(parents=True)
+            stale_file = stale_evidence_dir / "stale.json"
+            stale_file.write_text("stale", encoding="utf-8")
             target_file.write_text(json.dumps([{"url": server.url, "title": "dedup-auth-lab", "score": 100}]), encoding="utf-8")
             proc = subprocess.run(
                 [
@@ -104,6 +118,10 @@ def main():
                     "--timeout",
                     "3",
                     "--no-proxy",
+                    "--fresh",
+                    "--redact-raw-findings",
+                    "--evidence-max-body-bytes",
+                    "96",
                     "--full-bypass",
                     "--collect-all-variants",
                     "--file-max-probes",
@@ -120,16 +138,41 @@ def main():
                 print(proc.stderr)
                 raise SystemExit(proc.returncode)
             report = json.loads((outdir / "report.json").read_text(encoding="utf-8"))
+            assert not stale_file.exists(), "--fresh should remove stale private evidence files"
+            assert_no_key_recursive(report, "raw")
+            assert_no_key_recursive(report, "raw_request")
+            assert_no_key_recursive(report, "raw_response")
             findings = flatten(report)
             user_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/user/list"]
             auth_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/auth/expired"]
-            permission_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path in ("/api/auth/permission", "/api/auth/data-error", "/api/auth/deep-error")]
+            permission_findings = [fi for fi in findings if urlparse(fi.get("url", "")).path == "/api/auth/permission"]
+            record_auth_findings = [
+                fi for fi in findings
+                if urlparse(fi.get("url", "")).path in ("/api/auth/data-error", "/api/auth/deep-error")
+            ]
             assert len(user_findings) == 1, f"user/list should aggregate to 1 finding, got {len(user_findings)}"
             assert user_findings[0].get("data_count") == 2, "aggregated representative should keep highest-value response"
+            evidence_file = user_findings[0].get("evidence_file")
+            assert evidence_file, "finding should point to saved private raw HTTP evidence even with report redaction"
+            evidence_path = outdir / evidence_file
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence_dir_mode = stat.S_IMODE(os.stat(evidence_path.parent).st_mode)
+            evidence_file_mode = stat.S_IMODE(os.stat(evidence_path).st_mode)
+            assert evidence_dir_mode == 0o700, oct(evidence_dir_mode)
+            assert evidence_file_mode == 0o600, oct(evidence_file_mode)
+            assert "page=1" not in evidence_path.name and "size=10" not in evidence_path.name, evidence_path.name
+            assert evidence_path.name.startswith("GET_"), evidence_path.name
+            assert any(t in evidence_path.name for t in ("GET_no_auth", "GET_empty_bearer", "GET_admin_token")), evidence_path.name
+            assert "GET /api/user/list" in evidence.get("raw_request", ""), evidence
+            assert "HTTP/1.1 200" in evidence.get("raw_response", ""), evidence
+            evidence_body = evidence.get("raw_response", "").split("\r\n\r\n", 1)[-1]
+            assert len(evidence_body.encode()) <= 96, len(evidence_body.encode())
             assert user_findings[0].get("variant_count", 0) > len(user_findings[0].get("sample_urls", [])), "variant_count should not be capped by sample_urls"
             assert len(user_findings[0].get("tests", [])) >= 2, "aggregated finding should preserve bypass tests"
             assert not auth_findings, "auth failure response should not be reported"
-            assert not permission_findings, "nested/case-insensitive auth failure response should not be reported"
+            assert not permission_findings, "top-level envelope auth failure response should not be reported"
+            assert len(record_auth_findings) == 2, "record-level auth-like text with private data should remain candidate data"
+            assert all(fi.get("assessment") == "exposure_candidate" and fi.get("confirmed") is False for fi in record_auth_findings), record_auth_findings
             assert report["stats"].get("merged_variants", 0) > 0, "merged variant stat missing"
             assert report.get("raw_events") == report["stats"].get("raw_events"), "top-level raw_events should match stats"
             assert report.get("aggregated_findings") == report["stats"].get("aggregated_findings"), "top-level aggregated_findings should match stats"

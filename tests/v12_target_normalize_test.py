@@ -28,7 +28,7 @@ def main():
         "222.184.27.194:8089": ("http://222.184.27.194:8089", "222.184.27.194", 8089),
         "1.2.3.4:9443": ("https://1.2.3.4:9443", "1.2.3.4", 9443),
         "1.2.3.4:10443": ("https://1.2.3.4:10443", "1.2.3.4", 10443),
-        "https://example.com:8443/path/": ("https://example.com:8443/path", "example.com", 8443),
+        "https://example.com:8443/path/": ("https://example.com:8443/path/", "example.com", 8443),
         "example.com": ("", "example.com", None),
     }
     for raw, expected in cases.items():

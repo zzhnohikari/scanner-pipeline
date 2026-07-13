@@ -85,7 +85,7 @@ class AppHandler(BaseHTTPRequestHandler):
             noise = "\n".join(f'fetch("/api/noise/{i}");' for i in range(120))
             js = noise + '\nservice.post("/api/zzzz/body-only/search", {deptId: deptId, pageNum: 1, pageSize: 10});'
             return self.send_text(js, "application/javascript")
-        if parsed.path == "/api/server/system/configInfo":
+        if parsed.path == "/api/config":
             return self.send_json({"code": 0, "data": {"system": "real-app", "phone": "13800001234"}})
         return self.send_json({"code": 404}, status=404)
 
@@ -107,13 +107,12 @@ def flatten(report):
     return [fi for host in report.get("findings", []) for fi in host.get("findings", [])]
 
 
-def run_scan(targets):
+def run_scan(targets, expand_ports=None):
     with tempfile.TemporaryDirectory() as tmp:
         target_file = Path(tmp) / "targets.json"
         outdir = Path(tmp) / "out"
         target_file.write_text(json.dumps(targets), encoding="utf-8")
-        proc = subprocess.run(
-            [
+        cmd = [
                 sys.executable,
                 str(SCANNER),
                 "--input",
@@ -130,7 +129,11 @@ def run_scan(targets):
                 "4",
                 "--param-max-probes",
                 "8",
-            ],
+        ]
+        if expand_ports:
+            cmd.extend(["--expand-api-ports", ",".join(str(p) for p in expand_ports)])
+        proc = subprocess.run(
+            cmd,
             text=True,
             capture_output=True,
             timeout=120,
@@ -157,13 +160,13 @@ def main():
     try:
         report = run_scan([
             {"url": f"127.0.0.1:{port_8443}", "title": "http-on-https-port", "score": 100},
-            {"url": "127.0.0.1", "title": "multi-port", "score": 100},
-        ])
+            {"url": f"127.0.0.1:{default_port}", "title": "multi-port", "score": 100},
+        ], expand_ports=[app_port])
         findings = flatten(report)
         urls = [fi.get("url", "") for fi in findings]
         if check_https_like_fallback:
             assert any(u.startswith(f"http://127.0.0.1:{port_8443}/") for u in urls), "HTTP fallback on HTTPS-like port failed"
-        assert any(f"http://127.0.0.1:{app_port}/api/server/system/configInfo" in u for u in urls), "multi-port probing missed app port"
+        assert any(f"http://127.0.0.1:{app_port}/api/config" in u for u in urls), "multi-port probing missed app port"
         assert any(urlparse(u).path == "/api/zzzz/body-only/search" for u in urls), "body-bound API beyond top80 missed"
         print("PROBE PRIORITY LAB PASS")
         print(f"vulnerable={report.get('vulnerable')} findings={len(findings)}")

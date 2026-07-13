@@ -221,7 +221,7 @@ API_PATTERNS = [
     (re.compile(r'''url\s*:\s*["']([^"']{2,200})["']''', re.I), 1),
     (re.compile(r'''path\s*:\s*["']([^"']{2,200})["']''', re.I), 1),
     (re.compile(r'''baseURL\s*:\s*["']([^"']{2,200})["']''', re.I), 1),
-    (re.compile(r'''\.(?:get|post|put|delete|patch)\s*\(\s*["']([^"']{2,200})["']''', re.I), 1),
+    (re.compile(r'''\.(?:get|post|put|patch)\s*\(\s*["']([^"']{2,200})["']''', re.I), 1),
     (re.compile(r'''axios\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["']''', re.I), 1),
     (re.compile(r'''fetch\s*\(\s*["']([^"']{2,200})["']''', re.I), 1),
     (re.compile(r'''request\s*\(\s*\{[^}]*?url\s*:\s*["']([^"']{2,200})["']''', re.I), 1),
@@ -233,16 +233,13 @@ API_INTEREST = re.compile(
     r'/api/|/user|/admin|/login|/logout|/auth|/token|/server|/system|'
     r'/device|/channel|/record|/platform|/role|/log|/data|/info|/config|'
     r'/push|/proxy|/group|/region|/upload|/download|/file|/notary|/enterprise|'
-    r'/portal|/biz|/nsc|/CmCon|/profile|/account|/setting|/manage|/dashboard|'
+    r'/portal|/biz|/profile|/account|/setting|/manage|/dashboard|'
     r'/query|/list|/search|/find|/monitor|/stream|/video|/camera|/media', re.I
 )
 
 SENSITIVE_TESTS = [
-    "/api/user/users", "/api/user/list", "/api/user/info", "/api/user/userInfo",
-    "/api/server/info", "/api/server/system/info", "/api/server/system/configInfo",
-    "/api/server/media_server/list", "/api/role/all", "/api/log/list",
-    "/api/device/query/devices", "/api/common/channel/list", "/api/common/channel/one",
-    "/api/userApiKey/userApiKeys",
+    "/api/status", "/api/health", "/api/version", "/api/config",
+    "/api/users", "/api/roles", "/api/logs", "/api/search",
     "/actuator", "/actuator/health", "/actuator/env", "/actuator/mappings",
     "/swagger-ui.html", "/swagger-resources", "/v2/api-docs", "/v3/api-docs",
     "/api-docs", "/doc.html", "/druid/index.html",

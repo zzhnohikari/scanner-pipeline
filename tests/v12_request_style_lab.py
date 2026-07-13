@@ -45,6 +45,16 @@ class BaseHandler(BaseHTTPRequestHandler):
     def not_found(self):
         self.send_body(404, "not found")
 
+    def read_body_params(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0")).decode(errors="ignore")
+        try:
+            data = json.loads(raw or "{}")
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {k: v[0] for k, v in parse_qs(raw).items()}
+
     def do_POST(self):
         self.do_GET()
 
@@ -60,7 +70,7 @@ class ObjectStyleHandler(BaseHandler):
             js = '''
             axios.get("/api/member/basic");
             axios({url:"/api/order/page", method:"post", data:{pageNo:p.pageNo||1, pageSize:20, customerId:p.customerId, orderStatus:p.orderStatus}});
-            request("/api/member/detail", {params:{memberId:id, includeAccount:true}});
+            request.get("/api/member/detail", {params:{memberId:id, includeAccount:true}});
             uni.request({url:"/api/mobile/patient/list", method:"POST", data:{hospitalId:hospitalId, keyword:kw, pageNum:1, pageSize:10}});
             wx.request({url:"/api/mobile/health/detail", data:{personId:pid, archiveNo:no}});
             const fd = new FormData(); fd.append("docId", docId); fd.append("fileType", "pdf"); axios.post("/api/doc/download", fd);
@@ -90,6 +100,24 @@ class ObjectStyleHandler(BaseHandler):
             return self.send_json({"code": 400})
         return self.not_found()
 
+    def do_POST(self):
+        self.record()
+        parsed = urlparse(self.path)
+        data = self.read_body_params()
+        if parsed.path == "/api/order/page":
+            if data.get("pageNo") and data.get("pageSize"):
+                return self.send_json({"code": 0, "data": {"records": [{"orderId": 1, "customerId": 7, "phone": "13800001111"}], "total": 1}})
+            return self.send_json({"code": 400, "msg": "pagination required"})
+        if parsed.path == "/api/mobile/patient/list":
+            if data.get("hospitalId") and data.get("pageNum"):
+                return self.send_json({"code": 0, "data": [{"patientId": 1, "name": "PatientA", "phone": "13800003333"}]})
+            return self.send_json({"code": 400})
+        if parsed.path == "/api/doc/download":
+            if data.get("docId"):
+                return self.send_body(200, b"%PDF-1.4\n" + b"0" * 2048, "application/pdf", {"Content-Disposition": 'attachment; filename="doc.pdf"'})
+            return self.send_json({"code": 400})
+        return self.not_found()
+
 
 class QsAndAngularHandler(BaseHandler):
     def do_GET(self):
@@ -103,8 +131,10 @@ class QsAndAngularHandler(BaseHandler):
             fetch("/api/ng/user/basic");
             fetch("/api/report/export", {method:"POST", body:qs.stringify({reportId:reportId, format:"xlsx", startDate:"2026-01-01", endDate:"2026-06-01"})});
             fetch("/api/audit/search?"+new URLSearchParams({operatorId:opId, actionType:type, page:1, size:20}));
-            this.http.post("/api/ng/user/search", {deptId:this.deptId, roleCode:this.roleCode, pageNum:1, pageSize:10}).subscribe();
-            this.http.get("/api/ng/device/detail", {params:{deviceId:this.deviceId, channelId:this.channelId}}).subscribe();
+            axios.post("/api/ng/user/search", {deptId:this.deptId, roleCode:this.roleCode, pageNum:1, pageSize:10});
+            axios.get("/api/ng/device/detail", {params:{deviceId:this.deviceId, channelId:this.channelId}});
+            this.http.post("/api/ng/untrusted/search", {deptId:this.deptId, pageNum:1}).subscribe();
+            this.http.get("/api/ng/untrusted/detail", {params:{deviceId:this.deviceId}}).subscribe();
             $.getJSON("/api/jquery/config/detail", {configId:cid, tenantId:tid}, function(r){});
             '''
             return self.send_body(200, js, "application/javascript")
@@ -129,6 +159,20 @@ class QsAndAngularHandler(BaseHandler):
         if parsed.path == "/api/jquery/config/detail":
             if q.get("configId"):
                 return self.send_json({"code": 0, "data": {"configId": 1, "secretKey": "demo-secret-key"}})
+            return self.send_json({"code": 400})
+        return self.not_found()
+
+    def do_POST(self):
+        self.record()
+        parsed = urlparse(self.path)
+        data = self.read_body_params()
+        if parsed.path == "/api/report/export":
+            if data.get("reportId") and data.get("format"):
+                return self.send_body(200, b"PK\x03\x04" + b"0" * 2048, "application/zip", {"Content-Disposition": 'attachment; filename="report.xlsx"'})
+            return self.send_json({"code": 400})
+        if parsed.path == "/api/ng/user/search":
+            if data.get("deptId") and data.get("pageNum"):
+                return self.send_json({"code": 0, "data": [{"userId": 1, "realName": "NgUser", "phone": "13800004444"}]})
             return self.send_json({"code": 400})
         return self.not_found()
 
@@ -179,6 +223,11 @@ def main():
                 print(proc.stderr)
                 raise SystemExit(proc.returncode)
             report = json.loads((outdir / "report.json").read_text(encoding="utf-8"))
+            inventory = [
+                json.loads(line)
+                for line in (outdir / "phase2_inventory.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
             findings = flatten(report)
             urls = {fi.get("url", "") for fi in findings}
             def has(path, **params):
@@ -188,16 +237,31 @@ def main():
                     if parsed.path.endswith(path) and all(q.get(k) == [v] for k, v in params.items()):
                         return True
                 return False
+            def hit(path, method):
+                return any(urlparse(fi.get("url", "")).path.endswith(path) and fi.get("method") == method for fi in findings)
 
-            assert has("/api/order/page", pageNo="1", pageSize="10"), "axios object data combo missing"
+            assert hit("/api/order/page", "POST"), "axios object data POST combo missing"
             assert has("/api/member/detail", memberId="1"), "request(url, params) missing"
-            assert has("/api/mobile/patient/list", hospitalId="1", pageNum="1"), "uni.request data combo missing"
-            assert has("/api/doc/download", docId="1", fileType="pdf"), "FormData append combo missing"
-            assert has("/api/report/export", reportId="1", format="xlsx"), "qs.stringify export combo missing"
+            assert hit("/api/mobile/patient/list", "POST"), "uni.request data POST combo missing"
+            assert hit("/api/doc/download", "POST"), "FormData append POST combo missing"
+            assert hit("/api/report/export", "POST"), "qs.stringify export POST combo missing"
             assert has("/api/audit/search", operatorId="1", page="1"), "URLSearchParams combo missing"
-            assert has("/api/ng/user/search", deptId="1", pageNum="1"), "Angular post combo missing"
-            assert has("/api/ng/device/detail", deviceId="1", channelId="1"), "Angular get params combo missing"
+            assert hit("/api/ng/user/search", "POST"), "direct axios POST body combo missing"
+            assert has("/api/ng/device/detail", deviceId="1", channelId="1"), "direct axios GET params combo missing"
             assert has("/api/jquery/config/detail", configId="1"), "jQuery getJSON combo missing"
+            ng_record = next(item for item in inventory if item.get("base") == servers[1].url)
+            ng_profile = ng_record.get("param_profile") or {}
+            for untrusted in ("/api/ng/untrusted/search", "/api/ng/untrusted/detail"):
+                assert untrusted in ng_record.get("apis", []), (untrusted, ng_record.get("apis", []))
+                assert untrusted not in (ng_profile.get("api_methods") or {}), ng_profile.get("api_methods")
+                assert untrusted not in (ng_profile.get("api_params") or {}), ng_profile.get("api_params")
+            assert not any(
+                method == "POST" and path.startswith("/api/ng/untrusted/")
+                for method, path in servers[1].hits
+            ), servers[1].hits
+            explicit_post_paths = {"/api/order/page", "/api/mobile/patient/list", "/api/doc/download", "/api/report/export", "/api/ng/user/search"}
+            get_hits = {(path, method) for server in servers for method, path in server.hits if method == "GET"}
+            assert not any(any(path.startswith(p) for p in explicit_post_paths) for path, _method in get_hits), get_hits
             assert not any(("this." in u or "undefined" in u) and "?" in u for u in urls), "expression leaked into query value"
             print("LAB PASS")
             print(f"targets={report.get('targets')} live={report.get('live')} vulnerable={report.get('vulnerable')} findings={len(findings)}")

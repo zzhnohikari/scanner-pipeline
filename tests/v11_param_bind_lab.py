@@ -26,6 +26,15 @@ class BaseLabHandler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(data)
     def j(self, o, st=200): self.s(st, json.dumps(o, ensure_ascii=False), "application/json")
     def nf(self): self.s(404, b"not found")
+    def body_params(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0")).decode(errors="ignore")
+        try:
+            data = json.loads(raw or "{}")
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {k: v[0] for k, v in parse_qs(raw).items()}
     def do_POST(self): self.do_GET()
 
 # ===== Target 1: Webpack SPA =====
@@ -35,7 +44,7 @@ class W1(BaseLabHandler):
         if p.path == "/": return self.s(200, '<!doctype html><html><head><title>SmartPark</title><link rel=preload href=/js/vendor.js as=script><link rel=preload href=/js/common.js as=script></head><body><div id=app></div><script src=/js/vendor.js></script><script src=/js/common.js></script><script src=/js/app.js></script></body></html>', "text/html")
         if p.path == "/js/vendor.js": return self.s(200, b"", "application/javascript")
         if p.path == "/js/common.js": return self.s(200, 'var api={baseURL:"/prod-api"};var request=function(o){return fetch(api.baseURL+o.url,{method:o.method||"GET",body:JSON.stringify(o.data),headers:o.headers})};', "application/javascript")
-        if p.path == "/js/app.js": return self.s(200, '''var userApi={listUser:function(p){return request({url:"/user/list",method:"POST",data:{pageNum:p.pageNum||1,pageSize:p.pageSize||20,orgId:p.orgId,keyword:p.keyword}})},getUserDetail:function(id){return request({url:"/user/detail",data:{userId:id}})},exportUser:function(ids){return request({url:"/user/export",data:{ids:ids,format:"xlsx"}})}};
+        if p.path == "/js/app.js": return self.s(200, '''var userApi={listUser:function(p){return request({url:"/prod-api/user/list",method:"POST",data:{pageNum:p.pageNum||1,pageSize:p.pageSize||20,orgId:p.orgId,keyword:p.keyword}})},getUserDetail:function(id){return request({url:"/user/detail",data:{userId:id}})},exportUser:function(ids){return request({url:"/user/export",data:{ids:ids,format:"xlsx"}})}};
 var deviceApi={listDevice:function(p){return fetch("/prod-api/device/list?"+new URLSearchParams({pageNum:p.pageNum||1,pageSize:p.pageSize||15,deviceType:p.deviceType}))},getStreamUrl:function(did,cid){return request({url:"/device/stream/play",data:{deviceId:did,channelId:cid,protocol:"rtsp"}})}};
 var fileCenter={download:function(fid){window.open("/prod-api/fileCenter/download?fileId="+fid)},preview:function(ac){return request({url:"/fileCenter/preview",data:{assetCode:ac}})}};
 window.__PROD_CONFIG__={"VUE_APP_BASE_API":"/prod-api"};''', "application/javascript")
@@ -60,6 +69,20 @@ window.__PROD_CONFIG__={"VUE_APP_BASE_API":"/prod-api"};''', "application/javasc
             return self.j({"code":400})
         return self.nf()
 
+    def do_POST(self):
+        self.record(); p = urlparse(self.path); data = self.body_params()
+        if p.path == "/prod-api/user/list":
+            if data.get("pageNum") and data.get("pageSize"):
+                return self.j({"code":0,"data":[{"userId":1,"userName":"ZhangSan","phone":"13800000001","orgId":101},{"userId":2,"userName":"LiSi","phone":"13900000002","orgId":102}],"total":2})
+            return self.j({"code":400,"msg":"pageNum required"})
+        if p.path == "/prod-api/user/export":
+            if data.get("ids"): return self.s(200,b"%PDF-1.4\n"+b"0"*2048,"application/pdf",{"Content-Disposition":'attachment; filename="users.pdf"'})
+            return self.j({"code":400})
+        if p.path == "/prod-api/fileCenter/preview":
+            if data.get("assetCode"): return self.s(200,b"\x89PNG\r\n\x1a\n"+b"0"*1024,"image/png")
+            return self.j({"code":400})
+        return self.nf()
+
 # ===== Target 2: jQuery Ajax =====
 class W2(BaseLabHandler):
     def do_GET(self):
@@ -81,14 +104,21 @@ function previewDoc(fp){$.post("/api/doc/preview",{path:fp,format:"html"});}''',
             return self.j({"code":400})
         return self.nf()
 
+    def do_POST(self):
+        self.record(); p = urlparse(self.path); data = self.body_params()
+        if p.path == "/api/doc/preview":
+            if data.get("path"): return self.s(200,b"%PDF-1.4\n"+b"0"*1024,"application/pdf")
+            return self.j({"code":400})
+        return self.nf()
+
 # ===== Target 3: Axios SPA =====
 class W3(BaseLabHandler):
     def do_GET(self):
         self.record(); p = urlparse(self.path); q = parse_qs(p.query)
         if p.path == "/": return self.s(200, '<!doctype html><html><head><title>DigitalGov</title><script src=/js/ax.js></script><script src=/js/build.js></script></head><body></body></html>', "text/html")
         if p.path == "/js/ax.js": return self.s(200, b"", "application/javascript")
-        if p.path == "/js/build.js": return self.s(200, '''var http=axios.create({baseURL:"/api/v1",timeout:15000});
-var api={queryUsers:function(p){return http.post("/users/page",{query:{name:p.name,status:p.status},pageable:{page:p.page||1,size:p.size||20,sort:"id,desc"}})},getUser:function(id){return http.get("/users/"+id)},exportUsers:function(f,fd){return http.post("/users/export",{filter:f,fields:fd,format:"xlsx"},{responseType:"blob"})},getDeviceList:function(p){return http.get("/devices",{params:{status:p.status,type:p.type,ownerId:p.ownerId,projectCode:p.projectCode}})},playRecord:function(did,st,et){return http.get("/records/playback",{params:{deviceId:did,start:st,end:et,stream:"main"}})}};''', "application/javascript")
+        if p.path == "/js/build.js": return self.s(200, '''var http=axios.create({timeout:15000});
+var api={queryUsers:function(p){return http.post("/api/v1/users/page",{query:{name:p.name,status:p.status},pageable:{page:p.page||1,size:p.size||20,sort:"id,desc"}})},getUser:function(id){return http.get("/api/v1/users/"+id)},exportUsers:function(f,fd){return http.post("/api/v1/users/export",{filter:f,fields:fd,format:"xlsx"},{responseType:"blob"})},getDeviceList:function(p){return http.get("/api/v1/devices",{params:{status:p.status,type:p.type,ownerId:p.ownerId,projectCode:p.projectCode}})},playRecord:function(did,st,et){return http.get("/api/v1/records/playback",{params:{deviceId:did,start:st,end:et,stream:"main"}})}};''', "application/javascript")
         if p.path == "/api/v1/users/page":
             if q.get("page") and q.get("size"):
                 return self.j({"code":200,"data":{"content":[{"id":1,"name":"ZhaoLiu","idCard":"320102198501012345","phone":"13800000004"}],"totalElements":1}})
@@ -100,6 +130,18 @@ var api={queryUsers:function(p){return http.post("/users/page",{query:{name:p.na
         if p.path == "/api/v1/devices": return self.j({"code":200,"data":[{"id":1,"name":"Camera01","status":"online","streamUrl":"rtsp://10.0.0.1/live"}]})
         if p.path == "/api/v1/records/playback":
             if q.get("deviceId"): return self.j({"code":200,"data":{"url":"rtsp://10.0.0.1:554/playback?start="+q.get("start",[""])[0]}})
+            return self.j({"code":400})
+        return self.nf()
+
+    def do_POST(self):
+        self.record(); p = urlparse(self.path); data = self.body_params()
+        if p.path == "/api/v1/users/page":
+            pageable = data.get("pageable") if isinstance(data.get("pageable"), dict) else {}
+            if data.get("page") or data.get("size") or pageable.get("page") or pageable.get("size"):
+                return self.j({"code":200,"data":{"content":[{"id":1,"name":"ZhaoLiu","idCard":"320102198501012345","phone":"13800000004"}],"totalElements":1}})
+            return self.j({"code":400,"msg":"page required"})
+        if p.path == "/api/v1/users/export":
+            if data.get("filter") or data.get("format"): return self.s(200,b"%PDF-1.4\n"+b"0"*4096,"application/pdf",{"Content-Disposition":'attachment; filename="users.pdf"'})
             return self.j({"code":400})
         return self.nf()
 
@@ -123,11 +165,15 @@ def main():
             fs = fl(r)
             urls = {fi.get("url","") for fi in fs}
             data = [fi for fi in fs if fi.get("data_count") or fi.get("data_keys")]
-            assert any("user" in u and ("list" in u or "page" in u) for u in urls), "user list missing"
+            def hit(path, method=None):
+                return any(urlparse(fi.get("url", "")).path.endswith(path) and (method is None or fi.get("method") == method) for fi in fs)
+            assert hit("/prod-api/user/list", "POST"), "webpack explicit POST user/list missing"
+            assert hit("/api/v1/users/page", "POST"), "axios explicit POST users/page missing"
             assert any("device" in u.lower() and "list" in u.lower() for u in urls), "device list missing"
             assert any("stream" in u.lower() or "play" in u.lower() for u in urls), "stream missing"
-            assert any("/prod-api/user/list?" in u and "pageNum=1" in u and "pageSize=10" in u for u in urls), "bound combo for webpack user/list missing"
-            assert any("/api/v1/users/page?" in u and "page=1" in u and "size=10" in u for u in urls), "bound combo for axios users/page missing"
+            explicit_post_paths = {"/prod-api/user/list", "/api/doc/preview", "/api/v1/users/page", "/api/v1/users/export"}
+            get_hits = {(path.split("?", 1)[0], method) for s in svrs for method, path in s.hits if method == "GET"}
+            assert not any(path in explicit_post_paths for path, _method in get_hits), get_hits
             bad_values = ("/device/stream/play", "/user/detail", "/users/export")
             for u in urls:
                 parsed = urlparse(u)

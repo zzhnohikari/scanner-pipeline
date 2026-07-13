@@ -1,0 +1,3 @@
+# Optional Phase 2 JavaScript AST parser. The default --js-ast-mode=auto
+# keeps the existing regex extractor when this dependency is unavailable.
+esprima>=4.0.1,<5

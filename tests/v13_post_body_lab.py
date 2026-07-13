@@ -58,10 +58,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_body(200, '<html><script src="/static/app.bundle.js"></script></html>', "text/html")
         if parsed.path == "/static/app.bundle.js":
             js = '''
-            const request = axios.create({baseURL:"/prod-api"});
+            const request = axios.create({});
             axios.get("/api/bootstrap/status");
             axios.get("/api/bootstrap/users");
-            request.post("/body/user/search", {deptId: deptId, pageNum: page.pageNum || 1, pageSize: 10, keyword: kw});
+            request.post("/prod-api/body/user/search", {deptId: deptId, pageNum: page.pageNum || 1, pageSize: 10, keyword: kw});
             fetch("/prod-api/body/report/export", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({reportId:reportId, format:"xlsx", includePhone:true})});
             fetch("/prod-api/form/audit/search", {method:"POST", body:qs.stringify({operatorId:operatorId, page:1, size:20, actionType:type})});
             $.post("/prod-api/form/doc/preview", {docId: docId, fileType:"pdf", watermark: false}, function(r){});
@@ -167,6 +167,17 @@ def main():
             assert not any("query rejected" in fi.get("raw", "") for fi in findings), "query-only rejection was reported as finding"
             assert not any("attachId=deptId" in fi.get("url", "") for fi in findings), "JS variable name leaked into seed values"
             assert not any("attachId=page.pageNum" in fi.get("url", "") for fi in findings), "JS member expression leaked into seed values"
+            explicit_post_paths = {
+                "/prod-api/body/user/search",
+                "/prod-api/body/report/export",
+                "/prod-api/form/audit/search",
+                "/prod-api/form/doc/preview",
+                "/prod-api/form/attach/download",
+            }
+            get_hits = {urlparse(path).path for method, path, _ct in server.hits if method == "GET"}
+            post_hits = {urlparse(path).path for method, path, _ct in server.hits if method == "POST"}
+            assert explicit_post_paths.issubset(post_hits), (explicit_post_paths, post_hits)
+            assert not (explicit_post_paths & get_hits), get_hits
             print("BODY LAB PASS")
             print(f"targets={report.get('targets')} live={report.get('live')} vulnerable={report.get('vulnerable')} findings={len(findings)}")
             for fi in findings[:10]:

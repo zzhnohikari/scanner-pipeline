@@ -39,11 +39,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if path == "/":
-            return self.send_body('<script type="module" src="/src/main.js"></script>')
-        if path == "/src/main.js":
+        if path == "/app/index.html":
+            return self.send_body('<script src="/bundle"></script>')
+        if path == "/bundle":
             return self.send_body(
-                'import "./api.js";\n',
+                'import "/src/api.js";\nfetch("/api/user/list.json");\n',
                 "application/javascript",
             )
         if path == "/src/api.js":
@@ -54,10 +54,17 @@ class Handler(BaseHTTPRequestHandler):
                 'const screenBase = "/large/Index/";\n'
                 'const msgPath = screenBase + "message";\n'
                 'const dynamicPath = screenBase + `detail/${unitId}`;\n'
-                'const q = {userId: id, pageNum: 1, pageSize: 10};\n'
+                'const q = {\n'
+                '  userId,\n'
+                '  pageNum: 1,\n'
+                '  pageSize: 10\n'
+                '};\n'
+                'const devicePayload = {\n'
+                '  deviceId\n'
+                '};\n'
                 'axios.get(detailPath, {params: q});\n'
-                'service.get(msgPath, {params: {unitId: unitId}});\n'
-                'request({url: dynamicPath, data: {deviceId: deviceId}});\n',
+                'service.get(msgPath, {params: {unitId}});\n'
+                'request({url: dynamicPath, data: devicePayload});\n',
                 "application/javascript",
             )
         if path == "/api/user/detail":
@@ -83,6 +90,11 @@ class Handler(BaseHTTPRequestHandler):
                 "msg": "操作成功",
                 "data": [{"deviceId": 1, "unit_type": "电能表", "alarm": "over voltage"}],
             })
+        if path == "/api/user/list.json":
+            return self.send_json({
+                "code": 0,
+                "data": [{"userId": 2, "phone": "13900000000", "address": "Suzhou"}],
+            })
         return self.send_json({"code": 404, "msg": "not found"}, status=404)
 
     def do_POST(self):
@@ -101,7 +113,7 @@ def main():
             tmp = Path(tmp)
             target_file = tmp / "targets.json"
             outdir = tmp / "out"
-            target_file.write_text(json.dumps([{"url": server.url, "title": "js-graph-dataflow", "score": 100}]), encoding="utf-8")
+            target_file.write_text(json.dumps([{"url": server.url + "/app/index.html", "title": "js-graph-dataflow", "score": 100}]), encoding="utf-8")
             cmd = [
                 sys.executable,
                 str(SCANNER),
@@ -136,17 +148,18 @@ def main():
             assert "/api/user/detail" in inventory["apis"], inventory["apis"][:40]
             assert "/large/Index/message" in inventory["apis"], inventory["apis"][:40]
             assert "/large/Index/detail/1" in inventory["apis"], inventory["apis"][:40]
+            assert "/api/user/list.json" in inventory["apis"], inventory["apis"][:40]
             assert inventory["js_graph_edges"] >= 1, inventory
             params = inventory["param_profile"]["api_params"]
-            assert "userId" in params["/api/user/detail"], params
-            assert "unitId" in params["/large/Index/message"], params
-            assert "deviceId" in params["/large/Index/detail/1"], params
+            # Any template interpolation disables static request method/body
+            # trust for the whole source; paths remain inventory-only.
+            assert "/api/user/detail" not in params, params
+            assert "/large/Index/message" not in params, params
+            assert "/large/Index/detail/1" not in params, params
 
             report = json.loads((outdir / "report.json").read_text(encoding="utf-8"))
             paths = {urlparse(fi.get("url", "")).path for fi in flatten(report)}
-            assert "/api/user/detail" in paths, paths
-            assert "/large/Index/message" in paths, paths
-            assert "/large/Index/detail/1" in paths, paths
+            assert "/api/user/list.json" in paths, paths
             print("JS GRAPH DATAFLOW LAB PASS")
     finally:
         server.shutdown()

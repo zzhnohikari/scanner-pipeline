@@ -11,6 +11,10 @@ SCANNER = ROOT / "pipeline" / "deep_scanner.py"
 
 
 class LabServer(ThreadingHTTPServer):
+    def __init__(self, addr, handler):
+        super().__init__(addr, handler)
+        self.hits = []
+
     @property
     def url(self):
         return f"http://127.0.0.1:{self.server_address[1]}"
@@ -42,6 +46,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        self.server.hits.append((self.command, self.path))
         if parsed.path == "/":
             return self.send_body(200, '<script src="/app.js"></script>', "text/html")
         if parsed.path == "/app.js":
@@ -56,6 +61,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        self.server.hits.append((self.command, self.path))
         data = self.read_json()
         if parsed.path == "/api/body-only/search":
             if data.get("deptId") and data.get("pageNum"):
@@ -120,13 +126,19 @@ def main():
             findings = flatten(report)
             paths = {urlparse(fi.get("url", "")).path for fi in findings}
             keys_by_path = {urlparse(fi.get("url", "")).path: set(fi.get("data_keys", [])) for fi in findings}
-            assert report.get("vulnerable") == 1, "pure body-only target did not become candidate"
+            assert report.get("vulnerable") == 0, "unauth-only findings must not be confirmed without auth baseline"
+            assert report.get("candidate_targets") == 1, "pure body-only target did not become candidate"
             assert "/api/body-only/search" in paths, "body-only flat POST endpoint missing"
             assert "/api/nested/user/search" in paths, "nested JSON endpoint missing"
             assert "/api/result/records" in paths, "result.records response missing"
             assert "/api/top/rows" in paths, "top-level rows response missing"
             assert "idCard" in keys_by_path.get("/api/result/records", set()), "result.records data keys not extracted"
             assert "address" in keys_by_path.get("/api/top/rows", set()), "rows data keys not extracted"
+            explicit_post_paths = {"/api/body-only/search", "/api/nested/user/search", "/api/result/records", "/api/top/rows"}
+            get_hits = {urlparse(path).path for method, path in server.hits if method == "GET"}
+            post_hits = {urlparse(path).path for method, path in server.hits if method == "POST"}
+            assert explicit_post_paths.issubset(post_hits), (explicit_post_paths, post_hits)
+            assert not (explicit_post_paths & get_hits), get_hits
             print("EDGE LAB PASS")
             print(f"targets={report.get('targets')} live={report.get('live')} vulnerable={report.get('vulnerable')} findings={len(findings)}")
             for fi in findings[:10]:

@@ -82,7 +82,7 @@ const assetCode = "demo-report-2026.pdf";
 axios.get("/prod-api/profile");
 axios.get("/prod-api/login/verifyCode");
 axios.get("/prod-api/download/webplugin.exe");
-axios.get("/prod-api/fileCenter/download?assetCode=demo-report-2026.pdf");
+axios.get("/tenant/prod-api/fileCenter/download?assetCode=demo-report-2026.pdf");
 axios.get("/prod-api/user/list?pageNum=1&pageSize=10");
 """
             return self.send_bytes(200, body, "application/javascript")
@@ -206,6 +206,10 @@ def flatten_findings(report):
     return [fi for host in report.get("findings", []) for fi in host.get("findings", [])]
 
 
+def flatten_observations(report):
+    return [fi for host in report.get("observations", []) for fi in host.get("observations", [])]
+
+
 def main():
     servers = [start_server(PrefixSpaHandler), start_server(SwaggerApiOnlyHandler), start_server(NoiseProfileHandler)]
     try:
@@ -231,6 +235,10 @@ def main():
                 "--timeout",
                 "3",
                 "--no-proxy",
+                # This lab isolates discovered-vs-file-baseline behavior. The
+                # independent Phase 2.5 dictionary intentionally contains file
+                # paths and is covered by its own regression.
+                "--disable-api-fuzz",
                 "--file-max-probes",
                 "4",
                 "--param-max-probes",
@@ -243,7 +251,11 @@ def main():
                 raise SystemExit(proc.returncode)
 
             report = json.loads((outdir / "report.json").read_text(encoding="utf-8"))
+            assert report.get("schema_version") == 2, report
+            assert report.get("vulnerable") == 0, report
+            assert report.get("candidate_targets", 0) >= 1, report
             findings = flatten_findings(report)
+            observations = flatten_observations(report)
             file_leaks = [fi for fi in findings if fi.get("file_leak")]
 
             assert any(
@@ -260,7 +272,7 @@ def main():
             assert not any("verifyCode" in fi.get("url", "") and fi.get("file_leak") for fi in findings), (
                 "captcha image was misclassified as a file leak"
             )
-            public_downloads = [fi for fi in file_leaks if fi.get("public_download_intel")]
+            public_downloads = [fi for fi in observations if fi.get("public_download_intel")]
             assert any("webplugin.exe" in fi.get("url", "") for fi in public_downloads), (
                 "public download was not classified as public_download_intel"
             )
@@ -270,6 +282,11 @@ def main():
             assert report.get("stats", {}).get("unique_data_endpoints", 0) > 0, "report stats missing unique data endpoints"
 
             all_hits = [path for server in servers for _, path in server.hits]
+            assert "/tenant/" in all_hits, "exact prefixed SPA page with trailing slash was not fetched"
+            assert "/tenant/assets/app.8f3a1.js" in all_hits, "prefixed SPA JS bundle was not downloaded"
+            assert any(path.startswith("/tenant/prod-api/fileCenter/download?assetCode=demo-report-2026.pdf") for path in all_hits), (
+                "prefixed fileCenter URL was not actively probed with its JS-derived query"
+            )
             assert not any(path.startswith("/api/common/download") for path in all_hits), (
                 "hardcoded file baseline was requested even though --enable-file-baseline was not set"
             )

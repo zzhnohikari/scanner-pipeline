@@ -20,6 +20,7 @@ class JSAsset:
     content_type: str = ""
     source: str = ""
     size: int = 0
+    content_truncated: bool = False
 
 
 @dataclass
@@ -48,6 +49,12 @@ class JSGraphResult:
     attempted_urls: Set[str] = field(default_factory=set)
     successful_urls: Set[str] = field(default_factory=set)
     skipped_common_urls: Set[str] = field(default_factory=set)
+    config_service_bases: List[Dict[str, Any]] = field(default_factory=list)
+    js_resource_inventory: List[Dict[str, Any]] = field(default_factory=list)
+    import_map_inventory: List[Dict[str, Any]] = field(default_factory=list)
+    asset_manifest_inventory: List[Dict[str, Any]] = field(default_factory=list)
+    source_map_inventory: List[Dict[str, Any]] = field(default_factory=list)
+    redacted_values: Set[str] = field(default_factory=set, repr=False)
     stats: Dict[str, Any] = field(default_factory=dict)
 
     def api_paths(self):

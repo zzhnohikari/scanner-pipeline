@@ -1,12 +1,9 @@
-# Phase 2.5 API Fuzz Wordlist — curated from real engagements.
-# These paths cover common patterns found in Chinese enterprise apps
-# (Java/Spring Boot, Go, PHP) that don't expose Swagger/OpenAPI docs.
+# Phase 2.5 API Fuzz Wordlist - generic synthetic REST patterns.
+# Deployment-specific paths must be supplied with --extra-api-wordlist.
 #
 # Format: one /path per line.  Lines starting with # are comments.
 # Paths with query params are used as templates for phase3 param probing.
 #
-# Source: State Grid + municipal service engagements 2025-2026.
-
 # ── Common REST resource endpoints ──
 /api/user/list
 /api/user/users
@@ -45,27 +42,19 @@
 /admin/log/list
 /admin/config/list
 
-# ── Auth bypass patterns (common enterprise Java frameworks) ──
-/auth/externalInterfaceApi/list
-/auth/leaveSchool/list
-/auth/company/api/getCompanyList
-/auth/getRandomCode
-/auth/account/getByOpenid/1
-/auth/cameraFile/api/outApiCheckPhotos
+# ── Generic authentication paths ──
+/api/auth/status
+/api/auth/profile
 
 # ── Main / business module patterns ──
-/main/outworkapi/users
-/main/outworkapi/list
 /main/api/user/list
 /main/api/device/list
 
 # ── Service / server info endpoints ──
 /api/server/list
 /api/server/info
-/api/server/media_server/list
-/api/server/media_server/online/list
-/api/server/system/configInfo
-/api/server/resource/info
+/api/server/status
+/api/server/config
 /api/device/list
 /api/device/query/devices?page=1&count=10
 /api/device/info
@@ -92,13 +81,6 @@
 /api/app/version
 /api/h5/user
 /api/h5/config
-
-# ── Workflow / OA patterns ──
-/api/workflow/list
-/api/workflow/task
-/api/oa/user
-/api/oa/dept
-/api/oa/notice
 
 # ── Report / statistics patterns ──
 /api/report/list

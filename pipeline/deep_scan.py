@@ -11,27 +11,15 @@ WORKERS = 30
 
 # Common unauthorized API paths to test on EVERY live host
 TEST_PATHS = [
-    "/api/user/users", "/api/user/list", "/api/user/info", "/api/user/userInfo",
-    "/api/server/info", "/api/server/system/info", "/api/server/system/configInfo",
-    "/api/server/media_server/list", "/api/server/resource/info",
-    "/api/role/all", "/api/log/list",
-    "/api/device/query/devices", "/api/common/channel/list", "/api/common/channel/one",
-    "/api/userApiKey/userApiKeys",
+    "/api/status", "/api/health", "/api/version", "/api/config",
+    "/api/users", "/api/roles", "/api/logs", "/api/search",
     "/actuator", "/actuator/health", "/actuator/env", "/actuator/mappings",
     "/actuator/info", "/actuator/beans", "/actuator/configprops",
     "/swagger-resources", "/swagger-ui.html", "/swagger-ui/index.html",
     "/v2/api-docs", "/v3/api-docs", "/api-docs", "/doc.html",
     "/druid/index.html", "/druid/login.html",
-    "/api/admin/user", "/api/admin/config", "/api/system/info",
-    "/api/nsc/user/users", "/api/platform/list",
-    "/back/findParam/list", "/back/findParam/all",
-    "/back/user/list", "/back/admin/info",
-    "/e/port/tongji.php",
-    "/api/p/toiletsList", "/api/p/parksList", "/api/p/bicyclesList",
-    "/api/portal/enterprise/list",
-    "/api/notary/name", "/api/notary/list",
-    "/api/tags/all", "/api/articles/all", "/api/talks",
-    "/prod-api/system/config", "/prod-api/user/list",
+    "/api/admin/users", "/api/admin/config", "/api/system/info",
+    "/api/files", "/api/reports", "/api/messages",
 ]
 
 AUTH_FAIL = [

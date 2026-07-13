@@ -2,10 +2,12 @@
 """Regression check for gzip-compressed HTTP bodies across scanner phases."""
 
 import gzip
+import io
 import importlib.util
 import json
 import sys
 import threading
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -73,6 +75,27 @@ def main():
     assert "/goods/itemNew" in apis, apis
     assert "/user/querycustomer" in apis, apis
     assert "/upload/uploadSign" in apis, apis
+
+    class CompressedResponse(io.BytesIO):
+        def __init__(self, value, encoding):
+            super().__init__(value)
+            self.headers = {"Content-Encoding": encoding, "Content-Type": "text/plain"}
+
+    expanded = b"A" * 2_000_000
+    raw_deflater = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    raw_deflate = raw_deflater.compress(expanded) + raw_deflater.flush()
+    for encoding, packed_body in (
+        ("gzip", gzip.compress(expanded)),
+        ("deflate", zlib.compress(expanded)),
+        ("deflate", raw_deflate),
+    ):
+        raw, bounded, bounded_text = scanner.read_http_response(
+            CompressedResponse(packed_body, encoding), max_size=4096,
+        )
+        assert len(raw) <= 4096, (encoding, len(raw))
+        assert 0 < len(bounded) <= 4096, (encoding, len(bounded))
+        assert len(bounded_text) <= 4096, (encoding, len(bounded_text))
+    assert "br" not in scanner.http_accept_encoding().split(", "), scanner.http_accept_encoding()
 
     server = LabServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

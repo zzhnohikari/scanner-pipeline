@@ -112,7 +112,36 @@ def main():
 
             report = json.loads((outdir / "report.json").read_text(encoding="utf-8"))
             assert report["vulnerable"] == 0, report
+            coverage_checkpoint = json.loads((outdir / "api_coverage.json").read_text(encoding="utf-8"))
+            assert report["api_inventory_total"] == coverage_checkpoint["api_inventory_total"]
+            assert report["api_coverage"] == coverage_checkpoint["api_coverage"]
+            assert report["stats"]["api_coverage"] == report["api_coverage"]
+            assert len(report["api_coverage_by_target"]) == 1
+            assert report["apis"] == 1, "legacy report.apis remains the base-record count"
+            checkpoint_wire = json.dumps(coverage_checkpoint, sort_keys=True)
+            assert "/api/public" not in checkpoint_wire and "?" not in checkpoint_wire
+            markdown = (outdir / "report.md").read_text(encoding="utf-8")
+            assert "## API 覆盖（仅聚合计数）" in markdown
+            assert "api_inventory_total:" in markdown and "coverage_complete:" in markdown
             assert not list(outdir.glob("http*.json")), "non-vulnerable target should not create checkpoint json"
+
+            # Reusing an outdir must rebuild current-run streams. Appending the
+            # previous Phase 2 records would put historical targets back into
+            # Phase 3 and can send probes outside the current input scope.
+            rerun = subprocess.run(cmd + ["--dry-run"], text=True, capture_output=True, timeout=120)
+            if rerun.returncode != 0:
+                print(rerun.stdout)
+                print(rerun.stderr)
+                raise SystemExit(rerun.returncode)
+            inventory_lines = [
+                json.loads(line)
+                for line in inventory_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert len(inventory_lines) == 1, inventory_lines
+            full_stream = outdir / "phase2_full.jsonl"
+            full_lines = [line for line in full_stream.read_text(encoding="utf-8").splitlines() if line.strip()]
+            assert len(full_lines) == 1, full_lines
             print("PHASE2 INVENTORY PERSIST LAB PASS")
     finally:
         server.shutdown()

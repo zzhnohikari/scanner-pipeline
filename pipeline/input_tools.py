@@ -131,7 +131,7 @@ def load_targets(path, input_format):
             except Exception:
                 continue
             item = input_item(
-                obj.get("final_url") or obj.get("url") or obj.get("input"),
+                obj.get("url") or obj.get("input") or obj.get("final_url"),
                 obj.get("title", ""),
                 obj.get("status_code", 0),
             )
